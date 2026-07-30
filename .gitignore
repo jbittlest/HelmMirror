@@ -1,0 +1,29 @@
+# --- Generated project files -------------------------------------------------
+# The Xcode project is generated from project.yml by XcodeGen, and the workspace
+# by CocoaPods. Both are build artifacts: regenerate with
+#   xcodegen generate && pod install
+*.xcodeproj/
+*.xcworkspace/
+
+# --- Dependencies ------------------------------------------------------------
+# MobileVLCKit is hundreds of MB; fetch it with `pod install` instead.
+Pods/
+
+# --- Swift Package Manager ---------------------------------------------------
+.build/
+.swiftpm/
+Package.resolved
+
+# --- Xcode -------------------------------------------------------------------
+DerivedData/
+build/
+*.xcuserstate
+xcuserdata/
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# --- macOS -------------------------------------------------------------------
+.DS_Store

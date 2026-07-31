@@ -615,6 +615,7 @@ private struct MirrorScreen: View {
     @State private var playback: MirrorPlaybackState = .opening
     @State private var everPlayed = false
     @State private var timedOut = false
+    @ObservedObject private var diagnostics = MirrorDiagnostics.shared
 
     /// If no frame has arrived by now, say so rather than showing black forever.
     private static let firstFrameTimeout: TimeInterval = 15
@@ -658,6 +659,22 @@ private struct MirrorScreen: View {
                         .foregroundStyle(.white.opacity(0.55))
                         .multilineTextAlignment(.center)
                         .padding(.horizontal, 28)
+
+                    // On-screen diagnostics: the phone is usually not tethered
+                    // when this fails, so the facts have to be readable here.
+                    if !diagnostics.text.isEmpty {
+                        ScrollView {
+                            Text(diagnostics.text)
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(.green.opacity(0.85))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .textSelection(.enabled)
+                        }
+                        .frame(maxHeight: 150)
+                        .padding(10)
+                        .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
+                        .padding(.horizontal, 20)
+                    }
 
                     if playback == .failed || playback == .ended || timedOut {
                         Button("Back to plotter list", action: onBack)

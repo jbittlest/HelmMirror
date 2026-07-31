@@ -30,6 +30,35 @@ import MobileVLCKit
 /// `MirrorPlayerView(rtspURL:onTouch:).aspectRatio(videoAspect, contentMode: .fit)`.
 /// If the view is ever laid out at a different aspect, the backing view
 /// letterboxes/pillarboxes internally and normalizes against the content rect.
+/// A tiny in-app diagnostic log, shown on screen when playback fails.
+///
+/// Reading VLC's own console requires the phone to be tethered and unlocked,
+/// which is not workable on a boat. Putting the facts on screen means they can
+/// simply be read off.
+public final class MirrorDiagnostics: ObservableObject, @unchecked Sendable {
+    public static let shared = MirrorDiagnostics()
+    private let lock = NSLock()
+    private var lines: [String] = []
+    @Published public private(set) var text: String = ""
+
+    private init() {}
+
+    public func log(_ message: String) {
+        NSLog("[HelmMirror] %@", message)
+        lock.lock()
+        lines.append(message)
+        if lines.count > 12 { lines.removeFirst(lines.count - 12) }
+        let joined = lines.joined(separator: "\n")
+        lock.unlock()
+        DispatchQueue.main.async { self.text = joined }
+    }
+
+    public func reset() {
+        lock.lock(); lines.removeAll(); lock.unlock()
+        DispatchQueue.main.async { self.text = "" }
+    }
+}
+
 /// What the player is doing, so the UI can say something instead of showing a
 /// black rectangle. Without this a VLC failure is completely invisible.
 public enum MirrorPlaybackState: Equatable {
@@ -151,6 +180,20 @@ final class MirrorVideoView: UIView, VLCMediaPlayerDelegate {
         isUserInteractionEnabled = true
         player.drawable = self
         player.delegate = self
+        Self.enableVLCLogging()
+    }
+
+    /// Turn on libvlc's own logging once. Its messages are the only way to see
+    /// WHY a stream produces no picture — the player API just reports "playing".
+    private static var loggingEnabled = false
+    private static func enableVLCLogging() {
+        guard !loggingEnabled else { return }
+        loggingEnabled = true
+        let lib = VLCLibrary.shared()
+        if lib.responds(to: Selector(("setDebugLogging:"))) {
+            lib.setValue(true, forKey: "debugLogging")
+            lib.setValue(3, forKey: "debugLoggingLevel")
+        }
     }
 
     // MARK: VLCMediaPlayerDelegate
@@ -160,6 +203,12 @@ final class MirrorVideoView: UIView, VLCMediaPlayerDelegate {
     }
 
     private func report(for state: VLCMediaPlayerState) {
+        let size = player.videoSize
+        MirrorDiagnostics.shared.log(
+            "vlc=\(Self.name(for: state)) out=\(player.hasVideoOut) "
+            + "size=\(Int(size.width))x\(Int(size.height)) "
+            + "tracks=\(player.numberOfVideoTracks) pos=\(String(format: "%.1f", player.position))")
+
         let mapped: MirrorPlaybackState
         switch state {
         case .opening:   mapped = .opening
@@ -174,6 +223,20 @@ final class MirrorVideoView: UIView, VLCMediaPlayerDelegate {
         default:         return          // .esAdded and friends: not interesting
         }
         emit(mapped)
+    }
+
+    static func name(for state: VLCMediaPlayerState) -> String {
+        switch state {
+        case .stopped:   return "stopped"
+        case .opening:   return "opening"
+        case .buffering: return "buffering"
+        case .ended:     return "ended"
+        case .error:     return "error"
+        case .playing:   return "playing"
+        case .paused:    return "paused"
+        case .esAdded:   return "esAdded"
+        @unknown default: return "other(\(state.rawValue))"
+        }
     }
 
     /// True only when VLC has an active video output producing a sized picture.
@@ -215,15 +278,27 @@ final class MirrorVideoView: UIView, VLCMediaPlayerDelegate {
         currentURLString = urlString
         guard let url = URL(string: urlString) else { return }
 
+        MirrorDiagnostics.shared.reset()
+        MirrorDiagnostics.shared.log("url \(urlString)")
+
         let media = VLCMedia(url: url)
-        // Low-latency live tuning. Do NOT add ":rtsp-tcp" — UDP transport only.
-        // `network-caching` (ms) is the primary latency knob (100–200 ms).
+        // Low-latency live tuning. The plotter serves RTP over UDP only and
+        // rejects TCP-interleaved with 461, so force UDP explicitly rather than
+        // relying on VLC's default (which prefers TCP on some builds — that
+        // negotiation failing is silent and looks exactly like "no video").
+        //
+        // Caching is deliberately more generous than the 150 ms first tried:
+        // too small a buffer on a busy boat network can starve the decoder so it
+        // never produces a first frame.
         media.addOptions([
-            "network-caching": 150,
-            "live-caching": 150,
+            "network-caching": 1000,
+            "live-caching": 1000,
+            "rtsp-tcp": false,
+            "rtsp-http": false,
             "clock-jitter": 0,
             "clock-synchro": 0,
-            "rtsp-frame-buffer-size": 500000
+            "rtsp-frame-buffer-size": 1000000,
+            "avcodec-hw": "none"      // rule out a hardware-decoder failure
         ])
         player.media = media
         // Re-assert the drawable here as well as in init: at init time this view

@@ -369,6 +369,45 @@ public enum Helm {
         if let best = scored.max(by: { $0.1 < $1.1 }) { return best.0 }
         return urls.first
     }
+
+    /// True when `host` is a numeric IPv4 literal such as "172.16.6.0".
+    public static func isNumericIPv4(_ host: String) -> Bool {
+        let parts = host.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 4 else { return false }
+        return parts.allSatisfy { p in
+            !p.isEmpty && p.count <= 3 && p.allSatisfy(\.isNumber) && (Int(p) ?? 999) <= 255
+        }
+    }
+
+    /// Replace the host in an `rtsp://host[:port]/path` URL, keeping port and path.
+    ///
+    /// The plotter advertises its video as an mDNS name
+    /// (`rtsp://garmin-j6-kraken-1234.local:554/…`). macOS resolves `.local`
+    /// system-wide, but VLC on iOS does its own name resolution and mDNS names
+    /// fail there — the stream opens and no frames ever arrive. Since discovery
+    /// already knows the plotter's numeric address, substitute it.
+    ///
+    /// Returns nil if the URL can't be parsed, so callers can keep the original.
+    public static func rewritingHost(of urlString: String, to newHost: String) -> String? {
+        guard let schemeRange = urlString.range(of: "://") else { return nil }
+        let scheme = urlString[urlString.startIndex..<schemeRange.lowerBound]
+        let rest = urlString[schemeRange.upperBound...]
+
+        // Split authority from path at the first "/".
+        let slash = rest.firstIndex(of: "/")
+        let authority = slash.map { String(rest[rest.startIndex..<$0]) } ?? String(rest)
+        let path = slash.map { String(rest[$0...]) } ?? ""
+
+        guard !authority.isEmpty else { return nil }
+
+        // Keep any :port. Ignore colons inside a bracketed IPv6 literal.
+        var port = ""
+        if !authority.hasPrefix("["), let colon = authority.lastIndex(of: ":") {
+            let candidate = authority[authority.index(after: colon)...]
+            if !candidate.isEmpty, candidate.allSatisfy(\.isNumber) { port = ":\(candidate)" }
+        }
+        return "\(scheme)://\(newHost)\(port)\(path)"
+    }
 }
 
 // MARK: - Touch payload encoder (16.16 fixed-point, normalized)

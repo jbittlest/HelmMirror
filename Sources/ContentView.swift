@@ -261,7 +261,20 @@ public final class HelmMirrorViewModel: ObservableObject {
 
     private func beginStreaming(_ url: String) {
         didStream = true
-        state = .streaming(rtspURL: url)
+        state = .streaming(rtspURL: playableURL(url))
+    }
+
+    /// The plotter hands back its video as an mDNS name
+    /// (`rtsp://garmin-j6-kraken-1234.local:554/…`). VLC on iOS resolves names
+    /// itself and does not do mDNS, so that URL opens and then never delivers a
+    /// frame. Discovery already resolved the plotter's numeric address, so swap
+    /// it in. Falls back to the original URL if anything doesn't parse.
+    private func playableURL(_ url: String) -> String {
+        guard let host = activePlotter?.host,
+              Helm.isNumericIPv4(host),
+              let rewritten = Helm.rewritingHost(of: url, to: host)
+        else { return url }
+        return rewritten
     }
 
     // MARK: Timers

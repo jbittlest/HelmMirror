@@ -210,6 +210,41 @@ do {
     expectTrue("no URLs -> nil", Helm.preferredRTSPURL(from: Helm.rtspURLs(in: "not a url")) == nil)
 }
 
+// MARK: - mDNS host substitution (VLC on iOS cannot resolve .local)
+
+section("Rewriting the RTSP host to a numeric IP")
+
+do {
+    let mdns = "rtsp://garmin-j6-kraken-3475525228.local:554/helm_1280x720.h264"
+    check("swaps .local host for the IP, keeping port and path",
+          Helm.rewritingHost(of: mdns, to: "172.16.6.0") ?? "nil",
+          "rtsp://172.16.6.0:554/helm_1280x720.h264")
+
+    check("works with no port",
+          Helm.rewritingHost(of: "rtsp://plotter.local/helm.h264", to: "172.16.6.0") ?? "nil",
+          "rtsp://172.16.6.0/helm.h264")
+
+    check("works with no path",
+          Helm.rewritingHost(of: "rtsp://plotter.local:554", to: "172.16.6.0") ?? "nil",
+          "rtsp://172.16.6.0:554")
+
+    check("an already-numeric host is harmless",
+          Helm.rewritingHost(of: "rtsp://10.0.0.5:554/a.h264", to: "172.16.6.0") ?? "nil",
+          "rtsp://172.16.6.0:554/a.h264")
+
+    expectTrue("garbage input -> nil so the caller keeps the original",
+               Helm.rewritingHost(of: "not-a-url", to: "172.16.6.0") == nil)
+
+    // Numeric-IPv4 detection gates the substitution: never swap in a name.
+    expectTrue("172.16.6.0 is numeric",   Helm.isNumericIPv4("172.16.6.0"))
+    expectTrue("172.16.99.247 is numeric", Helm.isNumericIPv4("172.16.99.247"))
+    expectTrue(".local name is not numeric",
+               !Helm.isNumericIPv4("garmin-j6-kraken-3475525228.local"))
+    expectTrue("300.1.1.1 is not numeric", !Helm.isNumericIPv4("300.1.1.1"))
+    expectTrue("three octets is not numeric", !Helm.isNumericIPv4("172.16.6"))
+    expectTrue("empty octet is not numeric", !Helm.isNumericIPv4("172..6.0"))
+}
+
 // MARK: - Touch encoding (SPEC §4.6)
 
 section("Touch encoding (16.16 fixed point)")

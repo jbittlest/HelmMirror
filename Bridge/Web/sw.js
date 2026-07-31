@@ -5,7 +5,9 @@
 // We cache only the app shell (page, icons, manifest) so the home-screen icon
 // opens instantly and shows a useful message even when the bridge is off.
 
-const SHELL = 'helmmirror-shell-v1';
+// Bump this on every page change — it evicts the old cache so phones that
+// already added the app to their home screen pick up the new version.
+const SHELL = 'helmmirror-shell-v2';
 const SHELL_FILES = [
   './',
   './index.html',

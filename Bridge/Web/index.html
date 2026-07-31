@@ -26,17 +26,17 @@
     padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
     overscroll-behavior:none;
   }
-  .wrap{max-width:560px;margin:0 auto;padding:22px 18px 40px}
+  .wrap{max-width:560px;margin:0 auto;padding:20px 18px 40px}
 
-  header{display:flex;align-items:center;gap:12px;margin-bottom:22px}
-  header img{width:44px;height:44px;border-radius:10px;display:block}
-  header h1{font-size:19px;margin:0;letter-spacing:-.01em}
+  header{display:flex;align-items:center;gap:12px;margin-bottom:18px}
+  header img{width:42px;height:42px;border-radius:10px;display:block}
+  header h1{font-size:18px;margin:0;letter-spacing:-.01em}
   header p{margin:2px 0 0;color:var(--muted);font-size:13px}
 
-  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px;margin-bottom:14px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px;margin-bottom:12px}
 
-  .status{display:flex;align-items:center;gap:10px;font-weight:600}
-  .dot{width:10px;height:10px;border-radius:50%;background:var(--muted);flex:none}
+  .status{display:flex;align-items:flex-start;gap:10px;font-weight:600}
+  .dot{width:10px;height:10px;border-radius:50%;background:var(--muted);flex:none;margin-top:6px}
   .dot.ok{background:var(--ok);box-shadow:0 0 0 4px rgba(45,212,191,.15)}
   .dot.warn{background:var(--warn);box-shadow:0 0 0 4px rgba(250,204,21,.15)}
   .dot.bad{background:var(--bad);box-shadow:0 0 0 4px rgba(248,113,113,.15)}
@@ -44,37 +44,49 @@
 
   label{display:block;font-size:13px;color:var(--muted);margin:0 0 6px}
   input[type=text]{
-    width:100%;padding:12px 13px;border-radius:10px;border:1px solid var(--line);
-    background:#0a1826;color:var(--ink);font-size:16px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+    width:100%;padding:13px;border-radius:10px;border:1px solid var(--line);
+    background:#0a1826;color:var(--ink);font-size:16px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
   }
   input[type=text]:focus{outline:none;border-color:var(--accent)}
 
   button{
-    width:100%;padding:13px;margin-top:10px;border:0;border-radius:10px;
+    width:100%;padding:14px;margin-top:10px;border:0;border-radius:10px;
     background:var(--accent);color:#04121d;font-size:16px;font-weight:650;cursor:pointer;
+    font-family:inherit;
   }
   button.ghost{background:transparent;color:var(--accent);border:1px solid var(--line);font-weight:500}
-  button:active{transform:translateY(1px)}
+  button:active{opacity:.85}
 
   ol{margin:10px 0 0;padding-left:20px;color:var(--muted);font-size:14px}
   ol li{margin-bottom:7px}
   ol b{color:var(--ink);font-weight:600}
   code{background:#0a1826;border:1px solid var(--line);border-radius:5px;padding:1px 6px;
-       font:13px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--accent);
-       word-break:break-all}
+       font:13px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--accent);word-break:break-all}
+  .ver{text-align:center;color:var(--muted);font-size:11px;margin-top:16px;opacity:.6}
 
-  .note{font-size:13px;color:var(--muted);margin-top:12px;padding-top:12px;border-top:1px solid var(--line)}
-
-  /* ---- Live mirror ---- */
+  /* ---------- Mirror ---------- */
   #stage{position:fixed;inset:0;background:#000;display:none;z-index:50}
   #stage.on{display:block}
   #video{width:100%;height:100%;object-fit:contain;background:#000;display:block}
   #touch{position:absolute;inset:0;touch-action:none}
-  #exit{
-    position:absolute;top:calc(env(safe-area-inset-top) + 10px);right:10px;width:auto;
-    margin:0;padding:9px 14px;font-size:13px;border-radius:9px;
-    background:rgba(10,20,32,.72);color:var(--ink);border:1px solid var(--line);
-    backdrop-filter:blur(8px);z-index:2
+
+  /* Overlay that ALWAYS gives a way out — never a dead black screen. */
+  #overlay{
+    position:absolute;inset:0;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;gap:14px;
+    background:rgba(6,14,22,.92);text-align:center;padding:26px;z-index:3;
+  }
+  #overlay.hide{display:none}
+  #overlay h2{margin:0;font-size:18px}
+  #overlay p{margin:0;color:var(--muted);font-size:14px;max-width:320px}
+  #overlay button{width:auto;min-width:170px;margin-top:4px}
+
+  #back{
+    position:absolute;top:calc(env(safe-area-inset-top) + 10px);left:10px;
+    width:auto;margin:0;padding:10px 15px;font-size:14px;font-weight:600;border-radius:10px;
+    background:rgba(10,20,32,.82);color:var(--ink);border:1px solid var(--line);
+    backdrop-filter:blur(8px);z-index:4;
   }
 </style>
 </head>
@@ -94,68 +106,71 @@
       <span class="dot" id="dot"></span>
       <span>
         <span id="stateText">Checking…</span>
-        <small id="stateHint">Looking for the bridge on your network</small>
+        <small id="stateHint">Looking for the bridge</small>
       </span>
     </div>
   </div>
 
   <div class="card">
-    <label for="host">Bridge address</label>
-    <input type="text" id="host" placeholder="192.168.1.42:8080"
+    <label for="host">Bridge address (from the Terminal window)</label>
+    <input type="text" id="host" placeholder="192.168.1.200:8080"
            autocapitalize="off" autocorrect="off" spellcheck="false" inputmode="url">
     <button id="connect">Connect</button>
     <button id="recheck" class="ghost">Check again</button>
   </div>
 
-  <div class="card" id="help">
-    <div style="font-weight:600;margin-bottom:4px">Getting connected</div>
+  <div class="card">
+    <div style="font-weight:600;margin-bottom:4px">How to use it</div>
     <ol>
-      <li>Join your phone to the <b>plotter's Wi-Fi</b> — the same one the Mac is on.</li>
-      <li>On the Mac, run <code>swift run helmbridge</code>. It prints an address.</li>
-      <li>Type that address above and tap <b>Connect</b>.</li>
-      <li>First time only: on the plotter, approve this device under
-          <b>Settings ▸ Communications ▸ Wi-Fi Network ▸ Wi-Fi Devices ▸ "View and Control"</b>.</li>
+      <li>Phone and Mac both on the <b>same Wi-Fi</b> (on the boat: the plotter's).</li>
+      <li>On the Mac run <code>swift run helmbridge</code> — it prints an address.</li>
+      <li>Type that address above, tap <b>Connect</b>.</li>
+      <li>First time: on the plotter approve <b>HelmMirror</b> under Settings ▸
+          Communications ▸ Wi-Fi Network ▸ Wi-Fi Devices ▸ <b>"View and Control"</b>.</li>
     </ol>
-    <div class="note" id="httpsNote" hidden>
-      <b style="color:var(--warn)">Heads up:</b> this page is loaded over HTTPS, and browsers block
-      HTTPS pages from talking to a plain-HTTP device on your local network. Tap Connect and it will
-      reopen the app directly from the bridge, which works. For the best experience, open the bridge
-      address itself and use <b>Share ▸ Add to Home Screen</b> from there.
-    </div>
   </div>
+
+  <div class="ver" id="ver">v2</div>
 </div>
 
 <div id="stage">
-  <video id="video" playsinline muted autoplay controls></video>
+  <video id="video" playsinline muted autoplay preload="auto"></video>
   <div id="touch"></div>
-  <button id="exit">Exit</button>
+  <button id="back">‹ Back</button>
+  <div id="overlay">
+    <h2 id="ovTitle">Starting…</h2>
+    <p id="ovText">Waiting for video from the bridge</p>
+    <button id="ovBtn" hidden>Tap to start</button>
+  </div>
 </div>
 
 <script>
 (function(){
   "use strict";
-
+  var VERSION = "v2";
   var $ = function(id){ return document.getElementById(id); };
   var KEY = "helmmirror.bridge";
   var isHTTPS = location.protocol === "https:";
-  // Served BY the bridge? Then talk to our own origin. Otherwise use the saved address.
-  var servedByBridge = !isHTTPS && location.hostname && location.hostname !== "localhost"
-                       || /^\d+\.\d+\.\d+\.\d+$/.test(location.hostname);
 
-  if (isHTTPS) $("httpsNote").hidden = false;
+  // Are we being served BY the bridge itself? True when this page came from a
+  // plain-HTTP origin that isn't the GitHub Pages copy. Parenthesised properly —
+  // the previous version had an && / || precedence bug here.
+  var servedByBridge = (!isHTTPS && !!location.host && location.hostname !== "localhost");
 
-  function saved(){ try { return localStorage.getItem(KEY) || ""; } catch(e){ return ""; } }
-  function save(v){ try { localStorage.setItem(KEY, v); } catch(e){} }
+  $("ver").textContent = VERSION + (servedByBridge ? " · served by bridge" : " · static");
+
+  function saved(){ try{ return localStorage.getItem(KEY) || ""; }catch(e){ return ""; } }
+  function save(v){ try{ localStorage.setItem(KEY, v); }catch(e){} }
 
   function normalize(v){
-    v = (v || "").trim().replace(/^https?:\/\//i, "").replace(/\/+$/, "");
-    if (!v) return "";
-    if (!/:\d+$/.test(v)) v += ":8080";
+    v = (v||"").trim().replace(/^https?:\/\//i,"").replace(/\/+$/,"");
+    if(!v) return "";
+    if(!/:\d+$/.test(v)) v += ":8080";
     return v;
   }
-
+  // Where to send API calls. Same-origin when the bridge served us.
   function base(){
-    if (servedByBridge) return "";              // same-origin
+    if(servedByBridge) return "";
     var h = normalize($("host").value || saved());
     return h ? "http://" + h : "";
   }
@@ -166,118 +181,159 @@
     $("stateHint").textContent = hint;
   }
 
-  // ---- Probe the bridge -------------------------------------------------
+  // ---------- screens ----------
+  function showSetup(cls, text, hint){
+    stopVideo();
+    $("stage").classList.remove("on");
+    if(text) setState(cls, text, hint);
+  }
+  function showStage(){ $("stage").classList.add("on"); }
+
+  function overlay(title, text, btnLabel, onBtn){
+    $("ovTitle").textContent = title;
+    $("ovText").textContent  = text;
+    var b = $("ovBtn");
+    if(btnLabel){ b.hidden = false; b.textContent = btnLabel; b.onclick = onBtn; }
+    else { b.hidden = true; b.onclick = null; }
+    $("overlay").classList.remove("hide");
+  }
+  function hideOverlay(){ $("overlay").classList.add("hide"); }
+
+  // ---------- probe ----------
   function probe(){
     var b = base();
-    if (!b && !servedByBridge){
-      setState("warn", "Not connected", "Enter the address your Mac printed, then tap Connect");
+    if(!servedByBridge && !b){
+      setState("warn","Not connected","Enter the address the Terminal printed, then tap Connect");
       return;
     }
-    setState("", "Connecting…", b || location.origin);
+    setState("","Connecting…", b || location.origin);
 
     var ctl = new AbortController();
-    var t = setTimeout(function(){ ctl.abort(); }, 4000);
+    var t = setTimeout(function(){ ctl.abort(); }, 5000);
 
-    fetch(b + "/status", { signal: ctl.signal, cache: "no-store" })
-      .then(function(r){ return r.ok ? r.json() : Promise.reject(new Error("HTTP " + r.status)); })
+    fetch(b + "/status", {signal:ctl.signal, cache:"no-store"})
+      .then(function(r){ return r.ok ? r.json() : Promise.reject(new Error("HTTP "+r.status)); })
       .then(function(s){
         clearTimeout(t);
-        if (s && s.streaming){
-          setState("ok", "Bridge connected", "Plotter is streaming — starting mirror");
+        if(s && s.streaming){
+          setState("ok","Connected", s.detail || "Starting the mirror");
           startMirror(b);
         } else {
-          setState("warn", "Bridge running, no plotter",
+          setState("warn","Bridge is running, but no plotter",
                    (s && s.detail) || "Check the Mac is on the plotter's Wi-Fi");
         }
       })
-      .catch(function(err){
+      .catch(function(){
         clearTimeout(t);
-        if (isHTTPS && b){
-          setState("warn", "Blocked by HTTPS", "Tap Connect to reopen directly from the bridge");
-        } else {
-          setState("bad", "Can't reach the bridge",
-                   b ? ("No response from " + b.replace("http://","")) : "Enter the bridge address above");
-        }
+        if(isHTTPS && b) setState("warn","Blocked by HTTPS","Tap Connect to reopen from the bridge itself");
+        else setState("bad","Can't reach the bridge",
+                      b ? ("No answer from " + b.replace("http://","")) : "Enter the address above");
       });
   }
 
-  // ---- Live mirror ------------------------------------------------------
-  var ctxScale = { w: 1, h: 1 };
+  // ---------- mirror ----------
+  var watchdog = null;
+
+  function stopVideo(){
+    if(watchdog){ clearTimeout(watchdog); watchdog = null; }
+    var v = $("video");
+    try{ v.pause(); }catch(e){}
+    v.removeAttribute("src");
+    try{ v.load(); }catch(e){}
+  }
 
   function startMirror(b){
     var v = $("video");
+    showStage();
+    overlay("Starting…","Waiting for video from the bridge");
+
     v.src = b + "/stream.m3u8";
-    $("stage").classList.add("on");
-    v.play().catch(function(){ /* user gesture may be required; controls are visible */ });
+
+    // If no frames arrive in 12s, go BACK to setup with a reason.
+    // (The old build just sat on a black screen forever.)
+    if(watchdog) clearTimeout(watchdog);
+    watchdog = setTimeout(function(){
+      if(v.readyState < 2){
+        showSetup("bad","Video didn't start",
+          "The bridge answered but no picture arrived. Is ffmpeg running in the Terminal?");
+      }
+    }, 12000);
+
+    v.onplaying = function(){
+      if(watchdog){ clearTimeout(watchdog); watchdog = null; }
+      hideOverlay();
+    };
+    v.onerror = function(){
+      showSetup("bad","Video error","The stream couldn't be played. Check the Terminal for errors.");
+    };
+    v.onstalled = function(){ overlay("Buffering…","Waiting for more video"); };
+    v.onwaiting = function(){ overlay("Buffering…","Waiting for more video"); };
+
+    // iOS can refuse autoplay even when muted. If it does, offer a real button
+    // instead of leaving a black screen.
+    var p = v.play();
+    if(p && p.catch){
+      p.catch(function(){
+        overlay("Ready","Tap to start the mirror","Tap to start", function(){
+          v.play().then(hideOverlay).catch(function(){
+            showSetup("bad","Couldn't start video","Safari blocked playback. Try reloading the page.");
+          });
+        });
+      });
+    }
   }
 
-  $("exit").addEventListener("click", function(){
-    var v = $("video");
-    v.pause(); v.removeAttribute("src"); v.load();
-    $("stage").classList.remove("on");
+  $("back").addEventListener("click", function(){
+    showSetup("", "Disconnected", "Tap Connect to reconnect");
   });
 
-  // Map a touch on the video element to normalized 0..1 coords in the VIDEO
-  // picture, compensating for object-fit:contain letterboxing.
-  function normPoint(clientX, clientY){
-    var v = $("video");
-    var r = v.getBoundingClientRect();
+  // ---------- touch ----------
+  function normPoint(cx, cy){
+    var v = $("video"), r = v.getBoundingClientRect();
     var vw = v.videoWidth || 1280, vh = v.videoHeight || 720;
-    var scale = Math.min(r.width / vw, r.height / vh);
-    var dw = vw * scale, dh = vh * scale;
-    var ox = r.left + (r.width - dw) / 2;
-    var oy = r.top + (r.height - dh) / 2;
-    var nx = (clientX - ox) / dw;
-    var ny = (clientY - oy) / dh;
-    return { x: Math.min(1, Math.max(0, nx)), y: Math.min(1, Math.max(0, ny)) };
+    var s = Math.min(r.width/vw, r.height/vh);
+    var dw = vw*s, dh = vh*s;
+    var ox = r.left + (r.width-dw)/2, oy = r.top + (r.height-dh)/2;
+    return { x: Math.min(1,Math.max(0,(cx-ox)/dw)), y: Math.min(1,Math.max(0,(cy-oy)/dh)) };
   }
-
-  function sendTouch(clientX, clientY, down){
-    var p = normPoint(clientX, clientY);
-    var b = base();
-    try {
-      fetch(b + "/touch", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ x: p.x, y: p.y, down: down ? 1 : 0 }),
-        keepalive: true
+  function sendTouch(cx, cy, down){
+    var p = normPoint(cx, cy);
+    try{
+      fetch(base() + "/touch", {
+        method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({x:p.x, y:p.y, down: down?1:0}), keepalive:true
       }).catch(function(){});
-    } catch(e){}
+    }catch(e){}
   }
-
   var pad = $("touch");
-  pad.addEventListener("touchstart", function(e){
-    e.preventDefault();
-    var t = e.changedTouches[0]; sendTouch(t.clientX, t.clientY, true);
-  }, { passive: false });
-  pad.addEventListener("touchmove", function(e){
-    e.preventDefault();
-    var t = e.changedTouches[0]; sendTouch(t.clientX, t.clientY, true);
-  }, { passive: false });
-  pad.addEventListener("touchend", function(e){
-    e.preventDefault();
-    var t = e.changedTouches[0]; sendTouch(t.clientX, t.clientY, false);
-  }, { passive: false });
-  pad.addEventListener("mousedown", function(e){ sendTouch(e.clientX, e.clientY, true); });
-  pad.addEventListener("mouseup",   function(e){ sendTouch(e.clientX, e.clientY, false); });
+  ["touchstart","touchmove","touchend"].forEach(function(ev){
+    pad.addEventListener(ev, function(e){
+      e.preventDefault();
+      var t = e.changedTouches[0];
+      sendTouch(t.clientX, t.clientY, ev !== "touchend");
+    }, {passive:false});
+  });
+  pad.addEventListener("mousedown", function(e){ sendTouch(e.clientX,e.clientY,true); });
+  pad.addEventListener("mouseup",   function(e){ sendTouch(e.clientX,e.clientY,false); });
 
-  // ---- Wire up ----------------------------------------------------------
+  // ---------- wire up ----------
   $("host").value = saved();
-
   $("connect").addEventListener("click", function(){
     var h = normalize($("host").value);
-    if (!h){ setState("bad", "Enter an address", "Something like 192.168.1.42:8080"); return; }
-    save(h);
-    // An HTTPS page cannot reach a plain-HTTP LAN device. Hand off to the bridge itself,
-    // which serves this same page over HTTP where everything works.
-    if (isHTTPS){ location.href = "http://" + h + "/"; return; }
+    if(!h && !servedByBridge){
+      setState("bad","Enter an address","Something like 192.168.1.200:8080");
+      return;
+    }
+    if(h) save(h);
+    // An HTTPS page can't reach a plain-HTTP device on your LAN. Hand off to the
+    // bridge, which serves this same page over HTTP where it works.
+    if(isHTTPS && h){ location.href = "http://" + h + "/"; return; }
     probe();
   });
-
   $("recheck").addEventListener("click", probe);
 
-  if ("serviceWorker" in navigator){
-    navigator.serviceWorker.register("sw.js").catch(function(){});
+  if("serviceWorker" in navigator){
+    navigator.serviceWorker.register("sw.js").then(function(reg){ reg.update(); }).catch(function(){});
   }
 
   probe();

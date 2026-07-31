@@ -46,7 +46,8 @@ let package = Package(
                 "ContentView.swift",
                 "HelmMirrorApp.swift",
                 "Info.plist",
-                "RTSP"                     // platform-only: Network / AVFoundation / UIKit
+                "RTSP",                    // platform-only: Network / AVFoundation / UIKit
+                "Recording"                // platform-only: AVFoundation / VideoToolbox / Photos
             ],
             sources: ["HelmProtocol.swift", "RTSPCore"]
         ),

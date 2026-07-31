@@ -20,6 +20,8 @@
 	<string>1.0</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>
@@ -32,6 +34,10 @@
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>HelmMirror connects to your Garmin chartplotter over the boat's Wi-Fi to mirror and control the helm display.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>HelmMirror saves the recordings and screenshots you take of the chartplotter into your photo library.</string>
+	<key>UIFileSharingEnabled</key>
+	<true/>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>

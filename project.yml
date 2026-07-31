@@ -68,6 +68,16 @@ targets:
         # --- ATS: allow plaintext HTTP to the plotter's on-device nginx ---
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
+        # --- Photo library: ADD-ONLY. Never add NSPhotoLibraryUsageDescription;
+        #     HelmMirror has no reason to read the user's photos and asking for
+        #     read access shows a much scarier prompt for no gain.
+        NSPhotoLibraryAddUsageDescription: >-
+          HelmMirror saves the recordings and screenshots you take of the
+          chartplotter into your photo library.
+        # --- Recordings are visible and copyable in the Files app, which is the
+        #     fallback whenever photo-library access is refused.
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
 
   # NOTE: there is deliberately NO macOS unit-test target here.
   # The wire core is verified through the root Package.swift instead:

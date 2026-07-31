@@ -179,43 +179,12 @@ open class H264VideoView: UIView {
     }
 
     /// Build a format description from all SPS followed by all PPS.
+    ///
+    /// The body moved to `H264SampleBuffer` (SPEC-RECORDING §3) so the recorder
+    /// and the snapshot decoder build the identical description from the
+    /// identical bytes. This forwarder keeps the call sites here unchanged.
     private static func makeFormatDescription(sps: [Data], pps: [Data]) -> CMVideoFormatDescription? {
-        let sets = sps + pps
-        let total = sets.reduce(0) { $0 + $1.count }
-        guard total > 0 else { return nil }
-
-        // One contiguous copy, because pointers taken from the individual `Data`
-        // values would only be valid inside their own `withUnsafeBytes` scope and
-        // CoreMedia needs them all live at the same instant.
-        let storage = UnsafeMutablePointer<UInt8>.allocate(capacity: total)
-        defer { storage.deallocate() }
-
-        var pointers: [UnsafePointer<UInt8>] = []
-        var sizes: [Int] = []
-        pointers.reserveCapacity(sets.count)
-        sizes.reserveCapacity(sets.count)
-
-        var offset = 0
-        for set in sets {
-            set.copyBytes(to: storage + offset, count: set.count)
-            pointers.append(UnsafePointer(storage + offset))
-            sizes.append(set.count)
-            offset += set.count
-        }
-
-        var format: CMVideoFormatDescription?
-        let status = pointers.withUnsafeBufferPointer { pointerArray in
-            sizes.withUnsafeBufferPointer { sizeArray in
-                CMVideoFormatDescriptionCreateFromH264ParameterSets(
-                    allocator: kCFAllocatorDefault,
-                    parameterSetCount: sets.count,
-                    parameterSetPointers: pointerArray.baseAddress!,
-                    parameterSetSizes: sizeArray.baseAddress!,
-                    nalUnitHeaderLength: 4,        // AVCC length prefix, matching the depacketizer
-                    formatDescriptionOut: &format)
-            }
-        }
-        return status == noErr ? format : nil
+        H264SampleBuffer.formatDescription(sps: sps, pps: pps)
     }
 
     // MARK: - Frames
@@ -268,80 +237,23 @@ open class H264VideoView: UIView {
     }
 
     /// Wrap AVCC bytes in a ready-to-render `CMSampleBuffer`.
+    ///
+    /// The body moved to `H264SampleBuffer` (SPEC-RECORDING §3). The two things
+    /// this forwarder pins are exactly the two the renderer needs and a file must
+    /// not have: the raw 90 kHz RTP timestamp as the presentation time (for
+    /// logging only — `DisplayImmediately` means presentation order is arrival
+    /// order, so nothing is ever held back waiting for a clock), and the
+    /// `DisplayImmediately` attachment itself.
     private static func makeSampleBuffer(avcc: Data,
                                          format: CMVideoFormatDescription,
                                          isKeyframe: Bool,
                                          rtpTimestamp: UInt32) -> CMSampleBuffer? {
-        let length = avcc.count
-
-        // Let CoreMedia own the memory and copy into it, rather than keeping the
-        // `Data` alive behind a custom block source for the buffer's lifetime.
-        var blockBuffer: CMBlockBuffer?
-        var status = CMBlockBufferCreateWithMemoryBlock(
-            allocator: kCFAllocatorDefault,
-            memoryBlock: nil,
-            blockLength: length,
-            blockAllocator: kCFAllocatorDefault,
-            customBlockSource: nil,
-            offsetToData: 0,
-            dataLength: length,
-            flags: 0,
-            blockBufferOut: &blockBuffer)
-        guard status == kCMBlockBufferNoErr, let blockBuffer else { return nil }
-
-        status = avcc.withUnsafeBytes { raw -> OSStatus in
-            guard let base = raw.baseAddress else { return kCMBlockBufferBadPointerParameterErr }
-            return CMBlockBufferReplaceDataBytes(with: base,
-                                                 blockBuffer: blockBuffer,
-                                                 offsetIntoDestination: 0,
-                                                 dataLength: length)
-        }
-        guard status == kCMBlockBufferNoErr else { return nil }
-
-        // The RTP clock is 90 kHz. This timestamp is for logging and debugging
-        // only: `DisplayImmediately` below means presentation order is arrival
-        // order, so nothing is ever held back waiting for a clock.
-        var timing = CMSampleTimingInfo(
-            duration: .invalid,
-            presentationTimeStamp: CMTime(value: CMTimeValue(rtpTimestamp), timescale: 90_000),
-            decodeTimeStamp: .invalid)
-        var sampleSize = length
-
-        var sampleBuffer: CMSampleBuffer?
-        status = CMSampleBufferCreateReady(
-            allocator: kCFAllocatorDefault,
-            dataBuffer: blockBuffer,
-            formatDescription: format,
-            sampleCount: 1,
-            sampleTimingEntryCount: 1,
-            sampleTimingArray: &timing,
-            sampleSizeEntryCount: 1,
-            sampleSizeArray: &sampleSize,
-            sampleBufferOut: &sampleBuffer)
-        guard status == noErr, let sampleBuffer else { return nil }
-
-        setAttachments(on: sampleBuffer, isKeyframe: isKeyframe)
-        return sampleBuffer
-    }
-
-    /// Per-sample attachments. These live in a mutable dictionary inside a CFArray,
-    /// so they have to be set through the CF API rather than a bridged Swift dict.
-    private static func setAttachments(on sampleBuffer: CMSampleBuffer, isKeyframe: Bool) {
-        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer,
-                                                                        createIfNecessary: true),
-              CFArrayGetCount(attachments) > 0 else { return }
-        let sample = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
-
-        // Render as soon as the frame decodes. With no control timebase attached,
-        // this is what gives the mirror its latency instead of queueing to a clock.
-        CFDictionarySetValue(sample,
-                             Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
-                             Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
-        if !isKeyframe {
-            CFDictionarySetValue(sample,
-                                 Unmanaged.passUnretained(kCMSampleAttachmentKey_NotSync).toOpaque(),
-                                 Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
-        }
+        H264SampleBuffer.make(avcc: avcc,
+                              format: format,
+                              isKeyframe: isKeyframe,
+                              presentationTime: CMTime(value: CMTimeValue(rtpTimestamp),
+                                                       timescale: 90_000),
+                              displayImmediately: true)
     }
 
     // MARK: - Renderer health

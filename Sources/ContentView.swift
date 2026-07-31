@@ -627,6 +627,9 @@ private struct MirrorScreen: View {
     @State private var timedOut = false
     @State private var attemptIndex = 0
     @ObservedObject private var diagnostics = MirrorDiagnostics.shared
+    /// Owns the passthrough recorder and the snapshot ring for as long as this
+    /// screen exists (SPEC-RECORDING §9.2). Recording is off until asked for.
+    @StateObject private var capture = MirrorCaptureController()
 
     /// How long to give one attempt before moving to the next combination.
     private static let attemptTimeout: TimeInterval = 8
@@ -654,12 +657,27 @@ private struct MirrorScreen: View {
 
             // Present at 16:9 so the content rect equals the view bounds and
             // MirrorPlayerView's nx = x/width, ny = y/height are exact (SPEC §7.4).
-            MirrorPlayerView(rtspURL: attempt.url, useTCP: attempt.useTCP, onTouch: onTouch) { state in
+            MirrorPlayerView(rtspURL: attempt.url,
+                             useTCP: attempt.useTCP,
+                             capture: capture,
+                             onTouch: onTouch) { state in
                 playback = state
-                if state.isPlaying { everPlayed = true; timedOut = false }
+                if state.isPlaying {
+                    everPlayed = true
+                    timedOut = false
+                    // Re-arms the snapshot ring, which `.id(attempt)` above tears
+                    // down on every step of the ladder. See `videoStarted()`.
+                    capture.videoStarted()
+                }
                 // live555 can fail in ways the API does not explain; just move on
                 // to the next URL/transport rather than stopping at the first one.
-                if state == .failed || state == .ended { nextAttempt() }
+                // `.stalled` deliberately does NOT stop a recording: the session
+                // gives a stall 10 s to recover and MP4 expresses the gap as a
+                // longer sample duration.
+                if state == .failed || state == .ended {
+                    capture.videoStopped()
+                    nextAttempt()
+                }
             }
             .id(attempt)   // rebuild the player when the attempt changes
             .aspectRatio(1280.0 / 720.0, contentMode: .fit)
@@ -725,7 +743,12 @@ private struct MirrorScreen: View {
         // Always reachable, and legible against black — the old faint chevron on a
         // black screen looked like the app had simply hung.
         .overlay(alignment: .topLeading) {
-            Button(action: onBack) {
+            Button {
+                // Finalize before the view goes away, not after: `dismantleUIView`
+                // is not guaranteed to run before the screen is gone.
+                capture.stopEverything(reason: .dismissed)
+                onBack()
+            } label: {
                 Label("Back", systemImage: "chevron.backward")
                     .font(.subheadline.weight(.semibold))
                     .padding(.horizontal, 14)
@@ -735,6 +758,14 @@ private struct MirrorScreen: View {
             .padding(12)
             .tint(.white)
         }
+        // The record / elapsed / snapshot bar. Content-sized and attached with
+        // `.overlay(alignment:)`, which does not expand it — see the touch
+        // contract at the top of RecordingControls.swift. It is drawn under the
+        // failure overlay whenever `showOverlay` is true, which is correct:
+        // there is nothing to record when there is no video.
+        .overlay(alignment: RecordingControlsPlacement.alignment) {
+            RecordingControlsBar(capture: capture)
+        }
         // One timer per attempt: if this combination produces nothing in time,
         // stop waiting on it and try the next.
         .task(id: attempt) {
@@ -743,6 +774,8 @@ private struct MirrorScreen: View {
             timedOut = true
             nextAttempt()
         }
+        .onAppear { capture.viewAppeared() }
+        .onDisappear { capture.stopEverything(reason: .dismissed) }
         .ignoresSafeArea()
         .statusBarHidden(true)
     }

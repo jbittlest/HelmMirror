@@ -1019,6 +1019,469 @@ do {
     check("an AUD alone produces no access unit", accessUnits(events).count, 0)
 }
 
+// MARK: - Recording and snapshots (SPEC-RECORDING §8)
+//
+// Everything below lives in Sources/RTSPCore/RecordingClock.swift — the file
+// SPEC-RECORDING §1.1 calls `RecordingCore.swift` — and imports nothing but
+// Foundation, so this harness still runs on a Mac with only the Command Line
+// Tools. No AVFoundation, VideoToolbox, Photos, ImageIO, CoreMedia or UIKit
+// type appears in a vector.
+
+/// Renderings of the pure layer's enums. Comparing a rendered string rather
+/// than an `==` gives a readable diff when a boundary moves.
+func describe(_ outcome: RTPTimelineOutcome) -> String {
+    switch outcome {
+    case .first(let t):             return "first(\(t))"
+    case .advanced(let t):          return "advanced(\(t))"
+    case .coalesced(let t):         return "coalesced(\(t))"
+    case .rejectedBackwards(let d): return "rejectedBackwards(\(d))"
+    case .discontinuity(let d):     return "discontinuity(\(d))"
+    }
+}
+
+func describe(_ decision: RecorderGateDecision) -> String {
+    switch decision {
+    case .write:              return "write"
+    case .skip(let reason):   return "skip(\(reason))"
+    case .finish(let reason): return "finish(\(reason))"
+    }
+}
+
+func describe(_ refusal: RecordingStartRefusal?) -> String {
+    guard let refusal else { return "nil" }
+    switch refusal {
+    case .insufficientSpace(let free, let required):
+        return "insufficientSpace(\(free), \(required))"
+    }
+}
+
+func describe(_ reason: RecordingStopReason?) -> String {
+    guard let reason else { return "nil" }
+    switch reason {
+    case .user:               return "user"
+    case .videoEnded:         return "videoEnded"
+    case .backgrounded:       return "backgrounded"
+    case .dismissed:          return "dismissed"
+    case .reachedMaxDuration: return "reachedMaxDuration"
+    case .reachedMaxSize:     return "reachedMaxSize"
+    case .lowStorage(let free): return "lowStorage(\(free))"
+    case .formatChanged:      return "formatChanged"
+    case .noKeyframe:         return "noKeyframe"
+    case .writerFailed(let d): return "writerFailed(\(d))"
+    }
+}
+
+/// Every stop reason, so §8.4's 56/57/58 can be exhaustive rather than a sample.
+let everyStopReason: [RecordingStopReason] = [
+    .user, .videoEnded, .backgrounded, .dismissed,
+    .reachedMaxDuration, .reachedMaxSize, .lowStorage(freeBytes: 1_234),
+    .formatChanged, .noKeyframe,
+    .writerFailed("disk I/O error"),
+    .writerFailed(""),
+    .writerFailed(String(repeating: "x", count: 400))
+]
+
+// MARK: Recording — RTP timeline (§8.1)
+
+section("Recording — RTP timeline")
+
+do {
+    // 1-4. The ordinary case: rebased to zero, then straight 30 fps deltas.
+    var timeline = RTPTimeline()
+    check("fresh timeline rebases to zero", describe(timeline.push(9000)), "first(0)")
+    check("+3000 advances", describe(timeline.push(12000)), "advanced(3000)")
+    check("+3000 again", describe(timeline.push(15000)), "advanced(6000)")
+    check("lastFrameDeltaTicks", String(timeline.lastFrameDeltaTicks), "3000")
+}
+
+do {
+    // 5. The 32-bit RTP clock wraps every ~13 h 15 m; the unsigned difference
+    //    reinterpreted as signed is the whole answer.
+    var timeline = RTPTimeline()
+    _ = timeline.push(0xFFFF_F000)
+    check("wraparound is a small forward delta",
+          describe(timeline.push(0x0000_1000)), "advanced(8192)")
+}
+
+do {
+    // 6. The exact boundary.
+    var timeline = RTPTimeline()
+    _ = timeline.push(0xFFFF_FFFF)
+    check("wraparound at 0xFFFFFFFF -> 0", describe(timeline.push(0)), "advanced(1)")
+}
+
+do {
+    // 7-9. A repeated timestamp is nudged one tick rather than dropped, and the
+    //      stream stays strictly monotonic afterwards.
+    var timeline = RTPTimeline()
+    _ = timeline.push(9000)
+    check("a duplicate timestamp coalesces", describe(timeline.push(9000)), "coalesced(1)")
+
+    var second = RTPTimeline()
+    _ = second.push(9000)
+    _ = second.push(12000)
+    check("duplicate after progress", describe(second.push(12000)), "coalesced(3001)")
+    check("strictly monotonic after a coalesce",
+          describe(second.push(15000)), "advanced(6001)")
+}
+
+do {
+    // 10-12. Backwards is refused and changes nothing, so the next sane
+    //        timestamp continues from where the file already is.
+    var timeline = RTPTimeline()
+    _ = timeline.push(9000)
+    check("backwards is rejected", describe(timeline.push(6000)), "rejectedBackwards(3000)")
+    check("a rejection leaves the timeline alone", String(timeline.lastEmittedTicks), "0")
+    check("a valid push after a rejection still works",
+          describe(timeline.push(12000)), "advanced(3000)")
+}
+
+do {
+    // 13-15. Beyond 60 s the plotter's clock moved, not time.
+    var timeline = RTPTimeline()
+    _ = timeline.push(0)
+    check("a 60 s + 1 tick jump is a discontinuity",
+          describe(timeline.push(5_400_001)), "discontinuity(5400001)")
+    check("a discontinuity leaves the timeline alone", String(timeline.lastEmittedTicks), "0")
+
+    var inside = RTPTimeline()
+    _ = inside.push(0)
+    check("exactly 60 s is still a gap, not a discontinuity",
+          describe(inside.push(5_400_000)), "advanced(5400000)")
+}
+
+do {
+    // 16. 500 frames across the wrap: every one accepted, ticks strictly up.
+    var timeline = RTPTimeline()
+    var rtp: UInt32 = 0xFFFF_0000
+    var previous: Int64 = -1
+    var allAccepted = true
+    var strictlyIncreasing = true
+    var last: Int64 = -1
+    for _ in 0..<500 {
+        let outcome = timeline.push(rtp)
+        guard let ticks = outcome.ticks else { allAccepted = false; break }
+        if ticks <= previous { strictlyIncreasing = false }
+        previous = ticks
+        last = ticks
+        rtp = rtp &+ 3000
+    }
+    expectTrue("500 pushes across the wrap are all accepted", allAccepted)
+    expectTrue("500 pushes are strictly increasing", strictlyIncreasing)
+    check("500 pushes land on 499 x 3000", String(last), "1497000")
+}
+
+do {
+    // 17-19. The tail duration for endSession, clamped to 60...10 fps.
+    var fresh = RTPTimeline()
+    check("nominal frame duration defaults to 30 fps",
+          String(fresh.nominalFrameDurationTicks), "3000")
+
+    var fast = RTPTimeline()
+    _ = fast.push(0)
+    _ = fast.push(1000)
+    check("a 1000-tick delta clamps up to 60 fps",
+          String(fast.nominalFrameDurationTicks), "1500")
+
+    var slow = RTPTimeline()
+    _ = slow.push(0)
+    _ = slow.push(20000)
+    check("a 20000-tick delta clamps down to 10 fps",
+          String(slow.nominalFrameDurationTicks), "9000")
+}
+
+do {
+    // 20. reset() is a fresh origin, not a continuation.
+    var timeline = RTPTimeline()
+    _ = timeline.push(9000)
+    _ = timeline.push(12000)
+    timeline.reset()
+    check("reset re-establishes the origin", describe(timeline.push(7)), "first(0)")
+}
+
+// MARK: Recording — keyframe gate (§8.2)
+
+section("Recording — keyframe gate")
+
+do {
+    // 21-23. A file must open on a sync sample, and never on a corrupt one.
+    var gate = RecorderGate()
+    check("fresh gate skips a non-keyframe",
+          describe(gate.decide(.accessUnit(isKeyframe: false, isCorrupt: false))),
+          "skip(waiting for keyframe)")
+
+    var corrupt = RecorderGate()
+    check("fresh gate skips a corrupt keyframe",
+          describe(corrupt.decide(.accessUnit(isKeyframe: true, isCorrupt: true))),
+          "skip(corrupt frame)")
+
+    var clean = RecorderGate()
+    check("fresh gate writes a clean keyframe",
+          describe(clean.decide(.accessUnit(isKeyframe: true, isCorrupt: false))),
+          "write")
+}
+
+do {
+    // 24-27. Mid-recording: a corrupt unit re-arms the keyframe gate, and the
+    //        file resyncs at the next IDR rather than writing a hole.
+    var gate = RecorderGate()
+    _ = gate.decide(.accessUnit(isKeyframe: true, isCorrupt: false))
+    gate.confirmWrite()
+    check("a clean P-frame after a write is written",
+          describe(gate.decide(.accessUnit(isKeyframe: false, isCorrupt: false))),
+          "write")
+    gate.confirmWrite()
+    check("a corrupt unit mid-recording is skipped",
+          describe(gate.decide(.accessUnit(isKeyframe: true, isCorrupt: true))),
+          "skip(corrupt frame)")
+    check("the next P-frame resyncs",
+          describe(gate.decide(.accessUnit(isKeyframe: false, isCorrupt: false))),
+          "skip(resyncing)")
+    check("the next keyframe ends the resync",
+          describe(gate.decide(.accessUnit(isKeyframe: true, isCorrupt: false))),
+          "write")
+}
+
+do {
+    // 28. Writer backpressure also re-arms the gate.
+    var gate = RecorderGate()
+    _ = gate.decide(.accessUnit(isKeyframe: true, isCorrupt: false))
+    gate.confirmWrite()
+    check("a busy writer is a skip", describe(gate.decide(.writerBusy)), "skip(writer busy)")
+    check("and the next P-frame resyncs",
+          describe(gate.decide(.accessUnit(isKeyframe: false, isCorrupt: false))),
+          "skip(resyncing)")
+}
+
+do {
+    // 29. So does a timeline rejection — AVAssetWriter would refuse the sample.
+    var gate = RecorderGate()
+    _ = gate.decide(.accessUnit(isKeyframe: true, isCorrupt: false))
+    gate.confirmWrite()
+    check("a rejected timestamp is a skip",
+          describe(gate.decide(.timelineRejected)), "skip(timestamp out of order)")
+    check("and the next keyframe recovers",
+          describe(gate.decide(.accessUnit(isKeyframe: true, isCorrupt: false))),
+          "write")
+}
+
+do {
+    // 30-31. One avcC per track: new parameter sets end a file that has content
+    //        and merely re-arm one that does not.
+    var written = RecorderGate()
+    _ = written.decide(.accessUnit(isKeyframe: true, isCorrupt: false))
+    written.confirmWrite()
+    check("new parameter sets end a written file",
+          describe(written.decide(.parameterSetsChanged)), "finish(format changed)")
+
+    var settling = RecorderGate()
+    check("new parameter sets before any write only re-arm",
+          describe(settling.decide(.parameterSetsChanged)), "skip(format settling)")
+}
+
+do {
+    // 32. A "recording" that never produces a file is a bug the user cannot see;
+    //     300 skipped units (~10 s at 30 fps) is where it gives up.
+    var gate = RecorderGate()
+    var three_hundredth = ""
+    for i in 1...300 {
+        let decision = gate.decide(.accessUnit(isKeyframe: false, isCorrupt: false))
+        if i == 300 { three_hundredth = describe(decision) }
+    }
+    check("the 300th skipped unit is still a skip", three_hundredth, "skip(waiting for keyframe)")
+    check("the 301st gives up",
+          describe(gate.decide(.accessUnit(isKeyframe: false, isCorrupt: false))),
+          "finish(no keyframe arrived)")
+}
+
+do {
+    // 33-35. Bookkeeping.
+    var gate = RecorderGate()
+    _ = gate.decide(.accessUnit(isKeyframe: false, isCorrupt: false))
+    _ = gate.decide(.accessUnit(isKeyframe: false, isCorrupt: false))
+    expectTrue("skips accumulate", gate.skipsSinceLastWrite == 2)
+    gate.confirmWrite()
+    check("confirmWrite resets the skip count", gate.skipsSinceLastWrite, 0)
+
+    var pending = RecorderGate()
+    _ = pending.decide(.accessUnit(isKeyframe: true, isCorrupt: false))
+    expectTrue("a .write decision alone does not set hasWritten", !pending.hasWritten)
+    pending.confirmWrite()
+    expectTrue("confirmWrite sets hasWritten", pending.hasWritten)
+
+    pending.reset()
+    expectTrue("reset clears hasWritten and re-arms the keyframe gate",
+               !pending.hasWritten && pending.needsKeyframe)
+}
+
+// MARK: Recording — filenames (§8.3)
+
+section("Recording — filenames")
+
+// 2026-07-25T17:20:00Z.
+let fixedInstant = Date(timeIntervalSince1970: 1_785_000_000)
+let utc = TimeZone(secondsFromGMT: 0)!
+let edt = TimeZone(secondsFromGMT: -14400)!
+
+do {
+    // 36-39. Deterministic, locale-free, and shifted by the caller's zone.
+    check("timestamp component",
+          RecordingNames.timestampComponent(fixedInstant, timeZone: utc),
+          "2026-07-25-172000")
+    check("video filename",
+          RecordingNames.videoFilename(fixedInstant, timeZone: utc),
+          "HelmMirror-2026-07-25-172000.mp4")
+    check("still filename",
+          RecordingNames.stillFilename(fixedInstant, timeZone: utc),
+          "HelmMirror-2026-07-25-172000.jpg")
+    check("timestamp component at UTC-4",
+          RecordingNames.timestampComponent(fixedInstant, timeZone: edt),
+          "2026-07-25-132000")
+}
+
+do {
+    // 40-42. Two snapshots inside one second are entirely possible.
+    let name = RecordingNames.videoFilename(fixedInstant, timeZone: utc)
+    check("first collision", RecordingNames.unique(name, existing: [name]),
+          "HelmMirror-2026-07-25-172000-2.mp4")
+    check("second collision",
+          RecordingNames.unique(name, existing: [name, "HelmMirror-2026-07-25-172000-2.mp4"]),
+          "HelmMirror-2026-07-25-172000-3.mp4")
+    check("no collision leaves the name alone",
+          RecordingNames.unique(name, existing: []), name)
+}
+
+do {
+    // 43. Filesystem- and URL-safe, in every zone, collided or not.
+    let forbidden = Set("/\\:*?\"<>| ")
+    var candidates: [String] = []
+    for zone in [utc, edt, TimeZone(secondsFromGMT: 13 * 3600)!] {
+        let video = RecordingNames.videoFilename(fixedInstant, timeZone: zone)
+        let still = RecordingNames.stillFilename(fixedInstant, timeZone: zone)
+        candidates.append(video)
+        candidates.append(still)
+        candidates.append(RecordingNames.unique(video, existing: [video]))
+        candidates.append(RecordingNames.unique(still, existing: [still]))
+    }
+    expectTrue("no filename contains a reserved character or a space",
+               candidates.allSatisfy { $0.allSatisfy { !forbidden.contains($0) } })
+    expectTrue("every filename is prefixed HelmMirror-",
+               candidates.allSatisfy { $0.hasPrefix("HelmMirror-") })
+}
+
+do {
+    // 44-45. The elapsed readout. Truncated, never rounded, so the label never
+    //        shows a time the file has not reached.
+    let inputs: [TimeInterval] = [0, 7, 59, 60, 83, 599, 600, 3599, 3600, 3753]
+    let expected = ["0:00", "0:07", "0:59", "1:00", "1:23",
+                    "9:59", "10:00", "59:59", "1:00:00", "1:02:33"]
+    for (seconds, want) in zip(inputs, expected) {
+        check("elapsedLabel(\(Int(seconds)))", RecordingNames.elapsedLabel(seconds), want)
+    }
+    check("elapsedLabel(-5) clamps", RecordingNames.elapsedLabel(-5), "0:00")
+    check("elapsedLabel(0.9) truncates", RecordingNames.elapsedLabel(0.9), "0:00")
+}
+
+// MARK: Recording — guards (§8.4)
+
+section("Recording — guards")
+
+let tenGiB: Int64 = 10_737_418_240
+let threeGiB: Int64 = 3_221_225_472
+let hundredMiB: Int64 = 104_857_600
+
+do {
+    // 46-48. Exactly 500 MiB is allowed; one byte less is a refusal the user can read.
+    check("exactly 500 MiB starts",
+          describe(RecordingGuards.canStart(freeBytes: 524_288_000)), "nil")
+    check("one byte under refuses",
+          describe(RecordingGuards.canStart(freeBytes: 524_287_999)),
+          "insufficientSpace(524287999, 524288000)")
+    check("the refusal reads as MB",
+          RecordingGuards.canStart(freeBytes: 524_287_999)?.message ?? "",
+          "Only 499 MB free — need 500 MB")
+}
+
+do {
+    // 49-55. The three running guards and their precedence.
+    check("just under 30 minutes keeps going",
+          describe(RecordingGuards.stopReason(elapsed: 1799, bytesWritten: 1_000,
+                                              freeBytes: tenGiB)), "nil")
+    check("30 minutes stops",
+          describe(RecordingGuards.stopReason(elapsed: 1800, bytesWritten: 1_000,
+                                              freeBytes: tenGiB)), "reachedMaxDuration")
+    check("2 GiB stops",
+          describe(RecordingGuards.stopReason(elapsed: 1, bytesWritten: 2_147_483_648,
+                                              freeBytes: tenGiB)), "reachedMaxSize")
+    check("exactly 200 MiB free keeps going",
+          describe(RecordingGuards.stopReason(elapsed: 1, bytesWritten: 1,
+                                              freeBytes: 209_715_200)), "nil")
+    check("one byte under 200 MiB stops",
+          describe(RecordingGuards.stopReason(elapsed: 1, bytesWritten: 1,
+                                              freeBytes: 209_715_199)),
+          "lowStorage(209715199)")
+    check("storage outranks size and duration",
+          describe(RecordingGuards.stopReason(elapsed: 3600, bytesWritten: threeGiB,
+                                              freeBytes: hundredMiB)),
+          "lowStorage(104857600)")
+    check("size outranks duration",
+          describe(RecordingGuards.stopReason(elapsed: 3600, bytesWritten: threeGiB,
+                                              freeBytes: tenGiB)), "reachedMaxSize")
+}
+
+do {
+    // 56-58. What counts as a failure, and the message budget.
+    let benign: [RecordingStopReason] = [.user, .videoEnded, .backgrounded, .dismissed]
+    expectTrue("the four ordinary stops are not failures",
+               benign.allSatisfy { !$0.isFailure })
+
+    let failures: [RecordingStopReason] = [
+        .reachedMaxDuration, .reachedMaxSize, .lowStorage(freeBytes: 1),
+        .formatChanged, .noKeyframe, .writerFailed("boom")
+    ]
+    expectTrue("the six abnormal stops are failures", failures.allSatisfy { $0.isFailure })
+
+    expectTrue("every stop message is 1...60 characters",
+               everyStopReason.allSatisfy { (1...60).contains($0.message.count) })
+    check("an empty writer detail still reads",
+          RecordingStopReason.writerFailed("   ").message, "Recording failed")
+}
+
+do {
+    // 59. The gate's reason strings go straight into a 110-character
+    //     diagnostics line shared with the RTSP handshake.
+    var reasons: [String] = []
+    func collect(_ decision: RecorderGateDecision) {
+        switch decision {
+        case .write: break
+        case .skip(let reason), .finish(let reason): reasons.append(reason)
+        }
+    }
+
+    var fresh = RecorderGate()
+    collect(fresh.decide(.accessUnit(isKeyframe: false, isCorrupt: false)))
+    collect(fresh.decide(.accessUnit(isKeyframe: true, isCorrupt: true)))
+    collect(fresh.decide(.parameterSetsChanged))
+    collect(fresh.decide(.writerBusy))
+    collect(fresh.decide(.timelineRejected))
+
+    var running = RecorderGate()
+    _ = running.decide(.accessUnit(isKeyframe: true, isCorrupt: false))
+    running.confirmWrite()
+    collect(running.decide(.accessUnit(isKeyframe: true, isCorrupt: true)))
+    collect(running.decide(.accessUnit(isKeyframe: false, isCorrupt: false)))
+    collect(running.decide(.parameterSetsChanged))
+
+    var starved = RecorderGate()
+    for _ in 0...301 {
+        collect(starved.decide(.accessUnit(isKeyframe: false, isCorrupt: false)))
+    }
+
+    expectTrue("all eight gate reasons were exercised", Set(reasons).count == 8)
+    expectTrue("every gate reason is at most 24 characters",
+               reasons.allSatisfy { !$0.isEmpty && $0.count <= 24 })
+}
+
 // MARK: - Summary
 
 print("\n" + String(repeating: "─", count: 46))

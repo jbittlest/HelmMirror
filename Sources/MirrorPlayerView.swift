@@ -145,17 +145,24 @@ public struct MirrorPlayerView: UIViewRepresentable {
     public let rtspURL: String
     public let useTCP: Bool
     public let videoAspect: CGFloat
+    /// Optional recording/snapshot tee (SPEC-RECORDING §9.1). Nil — the default —
+    /// means the player behaves exactly as it did before recording existed.
+    public let capture: MirrorCaptureController?
     public let onTouch: ([HelmTouchPoint]) -> Void
     public let onState: (MirrorPlaybackState) -> Void
 
+    /// `capture:` is placed before `onTouch:` and defaulted, so every existing
+    /// labelled call site stays source-compatible and unchanged in behaviour.
     public init(rtspURL: String,
                 useTCP: Bool = false,
                 videoAspect: CGFloat = 1280.0 / 720.0,
+                capture: MirrorCaptureController? = nil,
                 onTouch: @escaping ([HelmTouchPoint]) -> Void,
                 onState: @escaping (MirrorPlaybackState) -> Void = { _ in }) {
         self.rtspURL = rtspURL
         self.useTCP = useTCP
         self.videoAspect = videoAspect
+        self.capture = capture
         self.onTouch = onTouch
         self.onState = onState
     }
@@ -165,6 +172,7 @@ public struct MirrorPlayerView: UIViewRepresentable {
         view.videoAspect = videoAspect
         view.onTouch = onTouch
         view.onState = onState
+        view.capture = capture
         view.play(urlString: rtspURL, useTCP: useTCP)
         return view
     }
@@ -175,6 +183,7 @@ public struct MirrorPlayerView: UIViewRepresentable {
         view.videoAspect = videoAspect
         view.onTouch = onTouch
         view.onState = onState
+        view.capture = capture
         // `play` is a no-op unless the URL or transport actually changed.
         view.play(urlString: rtspURL, useTCP: useTCP)
     }
@@ -208,6 +217,29 @@ final class MirrorVideoView: H264VideoView {
 
     /// Sink for normalized touch batches. Set by the representable each update.
     var onTouch: (([HelmTouchPoint]) -> Void)?
+
+    /// The recording/snapshot tee (SPEC-RECORDING §9.1).
+    ///
+    /// Lock-guarded because SwiftUI writes it on main while the video queue
+    /// reads it on every access unit. An uncontended `NSLock` is ~20 ns, i.e.
+    /// ~1.8 µs per second at 30 fps — nothing next to a frame's decode.
+    private let captureLock = NSLock()
+    private var _capture: MirrorCaptureController?
+    var capture: MirrorCaptureController? {
+        get {
+            captureLock.lock()
+            defer { captureLock.unlock() }
+            return _capture
+        }
+        set {
+            captureLock.lock()
+            _capture = newValue
+            captureLock.unlock()
+            // The snapshot path wants the renderer's layer for its iOS 17.4+
+            // fast path. `attach` is nonisolated and hops to main itself.
+            newValue?.attach(displayLayer: displayLayer)
+        }
+    }
 
     // Stable per-finger `track_id`s. A `UITouch` instance is reused by UIKit
     // across a finger's lifetime, so its `ObjectIdentifier` is a stable key.
@@ -275,13 +307,19 @@ final class MirrorVideoView: H264VideoView {
         let session = RTSPVideoSession(url: urlString, preferTCP: useTCP)
         // Parameter sets and access units arrive on the session's video queue;
         // both of these are documented safe to call from it.
+        // The tee runs AFTER the display call, always. The mirror's latency is
+        // the product; nothing may be inserted ahead of `enqueue`.
         session.onParameterSets = { [weak self] ps in
-            self?.setParameterSets(sps: ps.sps, pps: ps.pps)
+            guard let self else { return }
+            self.setParameterSets(sps: ps.sps, pps: ps.pps)
+            self.capture?.noteParameterSets(ps)
         }
         session.onAccessUnit = { [weak self] au in
-            self?.enqueue(accessUnit: au.avcc,
-                          isKeyframe: au.isKeyframe,
-                          rtpTimestamp: au.rtpTimestamp)
+            guard let self else { return }
+            self.enqueue(accessUnit: au.avcc,
+                         isKeyframe: au.isKeyframe,
+                         rtpTimestamp: au.rtpTimestamp)
+            self.capture?.append(au)
         }
         session.onState = { [weak self] state in
             self?.emit(state)
@@ -292,6 +330,13 @@ final class MirrorVideoView: H264VideoView {
 
     /// Stop playback and release resources. Called from `dismantleUIView`.
     func teardown() {
+        // Detach the tee first, so nothing can be appended to a recording that
+        // is already closing. `dismantleUIView` runs on main; the hop is there
+        // because `stopEverything` is `@MainActor` and `teardown` is not.
+        let c = capture
+        capture = nil
+        Task { @MainActor in c?.stopEverything(reason: .dismissed) }
+
         session?.stop()
         session = nil
         reset()

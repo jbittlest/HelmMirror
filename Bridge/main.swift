@@ -402,6 +402,13 @@ func runPlayOnThisMac(rtspURL: String, lifecycle: Lifecycle) async {
     say()
     say("Playing the plotter's screen on this Mac. Press Control-C here to stop.")
     say()
+    // --play deliberately skips the web server, so no phone address is printed.
+    // Say so out loud: otherwise it looks like the phone URL failed to appear.
+    say("NOTE: --play shows the mirror on THIS MAC only. It does not start the")
+    say("      web server, so there is no address for your phone in this mode.")
+    say("      To use your phone instead, stop this (Control-C) and run:")
+    say("          swift run helmbridge")
+    say()
 }
 
 func runServer(pipeline: HLSPipeline,

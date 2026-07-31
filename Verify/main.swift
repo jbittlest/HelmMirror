@@ -169,6 +169,47 @@ do {
                inbound3 == .event(subtype: 1, data: Data([0xAA, 0xBB, 0xCC])))
 }
 
+// MARK: - Multi-URL EVENT (regression: real GPSMAP hardware, 2026-07-30)
+
+section("Multiple RTSP URLs in one EVENT")
+
+do {
+    // Verbatim from a live plotter. It offers one URL per resolution in a single
+    // payload; the first build glued them together and handed the blob to ffmpeg,
+    // which failed with "Invalid data found when processing input".
+    let host = "garmin-j6-kraken-3475525228.local"
+    let hi = "rtsp://\(host):554/helm_1280x720.h264"
+    let lo = "rtsp://\(host):554/helm_960x540.h264"
+
+    for (label, sep) in [("NUL-separated", "\0"), ("newline-separated", "\n"), ("CRLF", "\r\n")] {
+        let blob = hi + sep + lo + "\0"
+        let found = Helm.rtspURLs(in: blob)
+        check("\(label): finds both URLs", found.count, 2)
+        expectTrue("\(label): picks the 1280x720 one",
+                   Helm.preferredRTSPURL(from: found) == hi)
+
+        let inbound = Helm.parse(HelmFrame(type: Helm.EVENT,
+                                           payload: eventPayload(subtype: 0, body: Array(blob.utf8))))
+        expectTrue("\(label): EVENT parse yields only the best URL", inbound == .rtspURL(hi))
+    }
+
+    // Order must not matter — lower resolution listed first.
+    let reversed = Helm.rtspURLs(in: lo + "\0" + hi)
+    expectTrue("picks highest resolution regardless of order",
+               Helm.preferredRTSPURL(from: reversed) == hi)
+
+    // A single URL must still behave exactly as before.
+    expectTrue("single URL unchanged", Helm.preferredRTSPURL(from: Helm.rtspURLs(in: hi)) == hi)
+
+    // Junk around the URLs must not leak into the result.
+    let messy = "  \(hi) \r\n \(lo) \0\0 "
+    expectTrue("whitespace/NUL noise stripped",
+               Helm.preferredRTSPURL(from: Helm.rtspURLs(in: messy)) == hi)
+
+    // No rtsp:// at all -> nil, so the caller falls back rather than playing garbage.
+    expectTrue("no URLs -> nil", Helm.preferredRTSPURL(from: Helm.rtspURLs(in: "not a url")) == nil)
+}
+
 // MARK: - Touch encoding (SPEC §4.6)
 
 section("Touch encoding (16.16 fixed point)")

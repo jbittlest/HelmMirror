@@ -301,10 +301,18 @@ public enum Helm {
             let end = min(8 + max(0, len), f.payload.count)
             let data = Data(Array(f.payload)[8 ..< end])
             if subtype == 0 {
-                // subtype 0 is the authoritative RTSP URL as UTF-8; trim NUL/whitespace.
+                // Subtype 0 carries the RTSP URL(s) as UTF-8.
+                //
+                // Real hardware (GPSMAP, observed on a live unit) sends MORE THAN ONE
+                // URL in a single payload — one per offered resolution, e.g.
+                //   rtsp://<host>:554/helm_1280x720.h264
+                //   rtsp://<host>:554/helm_960x540.h264
+                // separated by NUL/newline. Naively trimming the ends yields both URLs
+                // glued together, which ffmpeg rejects with "Invalid data found when
+                // processing input". Split, then pick the highest resolution offered.
                 if let s = String(data: data, encoding: .utf8) {
-                    let trimmed = s.trimmingCharacters(in: CharacterSet(charactersIn: "\0 \r\n"))
-                    if !trimmed.isEmpty { return .rtspURL(trimmed) }
+                    let urls = Helm.rtspURLs(in: s)
+                    if let best = Helm.preferredRTSPURL(from: urls) { return .rtspURL(best) }
                 }
                 return .event(subtype: 0, data: data)
             }
@@ -313,6 +321,53 @@ public enum Helm {
         default:
             return nil
         }
+    }
+
+    // ---- RTSP URL extraction ----
+
+    /// Every `rtsp://` URL contained in a blob, split on NUL / newline / whitespace.
+    /// The plotter packs one URL per offered resolution into a single EVENT payload.
+    public static func rtspURLs(in blob: String) -> [String] {
+        let separators = CharacterSet(charactersIn: "\0\r\n\t ")
+        return blob
+            .components(separatedBy: separators)
+            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "\0 \r\n\t")) }
+            .filter { $0.lowercased().hasPrefix("rtsp://") && $0.count > 8 }
+    }
+
+    /// Pixel count parsed from a `..._<W>x<H>.h264` style path, or nil.
+    static func resolutionScore(_ url: String) -> Int? {
+        // Scan for the last <digits>x<digits> group in the URL.
+        var best: Int? = nil
+        let chars = Array(url)
+        var i = 0
+        while i < chars.count {
+            guard chars[i].isNumber else { i += 1; continue }
+            var j = i
+            while j < chars.count, chars[j].isNumber { j += 1 }
+            guard j < chars.count, chars[j] == "x" || chars[j] == "X" else { i = j + 1; continue }
+            let w = Int(String(chars[i..<j])) ?? 0
+            var k = j + 1
+            let hStart = k
+            while k < chars.count, chars[k].isNumber { k += 1 }
+            guard k > hStart else { i = k + 1; continue }
+            let h = Int(String(chars[hStart..<k])) ?? 0
+            if w > 0 && h > 0 { best = max(best ?? 0, w * h) }
+            i = k
+        }
+        return best
+    }
+
+    /// Pick the URL to actually play: highest resolution offered, falling back to
+    /// the first one when no resolution can be parsed.
+    public static func preferredRTSPURL(from urls: [String]) -> String? {
+        guard !urls.isEmpty else { return nil }
+        let scored = urls.compactMap { u -> (String, Int)? in
+            guard let s = resolutionScore(u) else { return nil }
+            return (u, s)
+        }
+        if let best = scored.max(by: { $0.1 < $1.1 }) { return best.0 }
+        return urls.first
     }
 }
 

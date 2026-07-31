@@ -243,6 +243,18 @@ do {
     expectTrue("300.1.1.1 is not numeric", !Helm.isNumericIPv4("300.1.1.1"))
     expectTrue("three octets is not numeric", !Helm.isNumericIPv4("172.16.6"))
     expectTrue("empty octet is not numeric", !Helm.isNumericIPv4("172..6.0"))
+
+    // Extracting the host is what lets us resolve it ourselves when discovery
+    // hands back a name rather than an address.
+    check("host of a .local URL with port",
+          Helm.hostComponent(of: mdns) ?? "nil", "garmin-j6-kraken-3475525228.local")
+    check("host with no port",
+          Helm.hostComponent(of: "rtsp://plotter.local/a.h264") ?? "nil", "plotter.local")
+    check("host that is numeric",
+          Helm.hostComponent(of: "rtsp://172.16.6.0:554/a.h264") ?? "nil", "172.16.6.0")
+    check("bracketed IPv6 host",
+          Helm.hostComponent(of: "rtsp://[fe80::1]:554/a.h264") ?? "nil", "fe80::1")
+    expectTrue("garbage -> nil", Helm.hostComponent(of: "nonsense") == nil)
 }
 
 // MARK: - Touch encoding (SPEC §4.6)

@@ -214,8 +214,47 @@ public final class GarminDiscovery: ObservableObject {
 
         guard let host, !host.isEmpty else { return nil }
         var resolved = plotter
-        resolved.host = host
+        // Prefer a numeric address. The endpoint often resolves to the plotter's
+        // mDNS name ("garmin-....local"), and while iOS resolves those fine,
+        // VLC does its own name lookup, cannot do mDNS, and fails the RTSP
+        // connection with error -57. Convert to a literal IPv4 here so every
+        // consumer — pairing, session and video — gets an address VLC can use.
+        resolved.host = Self.numericIPv4(for: host) ?? host
         return resolved
+    }
+
+    /// Resolve a hostname to a literal IPv4 address using the system resolver
+    /// (which does handle `.local` mDNS names). Returns nil if it can't be
+    /// resolved, or the input unchanged if it is already numeric.
+    static func numericIPv4(for host: String) -> String? {
+        if Helm.isNumericIPv4(host) { return host }
+
+        var hints = addrinfo(ai_flags: 0,
+                             ai_family: AF_INET,       // IPv4 only: VLC's RTSP wants a plain dotted quad
+                             ai_socktype: SOCK_STREAM,
+                             ai_protocol: IPPROTO_TCP,
+                             ai_addrlen: 0,
+                             ai_canonname: nil,
+                             ai_addr: nil,
+                             ai_next: nil)
+
+        var result: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(host, nil, &hints, &result) == 0, let first = result else { return nil }
+        defer { freeaddrinfo(result) }
+
+        for info in sequence(first: first, next: { $0.pointee.ai_next }) {
+            guard let addr = info.pointee.ai_addr, addr.pointee.sa_family == sa_family_t(AF_INET) else { continue }
+            var buffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            let status = getnameinfo(addr, socklen_t(addr.pointee.sa_len),
+                                     &buffer, socklen_t(buffer.count),
+                                     nil, 0, NI_NUMERICHOST)
+            guard status == 0 else { continue }
+            let text = buffer.withUnsafeBufferPointer { raw in
+                raw.baseAddress.map { String(cString: $0) }
+            }
+            if let text, Helm.isNumericIPv4(text) { return text }
+        }
+        return nil
     }
 
     // MARK: Helpers

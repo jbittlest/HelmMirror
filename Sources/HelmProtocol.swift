@@ -370,6 +370,26 @@ public enum Helm {
         return urls.first
     }
 
+    /// The host part of an `rtsp://host[:port]/path` URL, without port or brackets.
+    public static func hostComponent(of urlString: String) -> String? {
+        guard let schemeRange = urlString.range(of: "://") else { return nil }
+        let rest = urlString[schemeRange.upperBound...]
+        let authority = rest.firstIndex(of: "/").map { String(rest[rest.startIndex..<$0]) }
+            ?? String(rest)
+        guard !authority.isEmpty else { return nil }
+
+        if authority.hasPrefix("["), let close = authority.firstIndex(of: "]") {
+            return String(authority[authority.index(after: authority.startIndex)..<close])
+        }
+        if let colon = authority.lastIndex(of: ":") {
+            let candidate = authority[authority.index(after: colon)...]
+            if !candidate.isEmpty, candidate.allSatisfy(\.isNumber) {
+                return String(authority[authority.startIndex..<colon])
+            }
+        }
+        return authority
+    }
+
     /// True when `host` is a numeric IPv4 literal such as "172.16.6.0".
     public static func isNumericIPv4(_ host: String) -> Bool {
         let parts = host.split(separator: ".", omittingEmptySubsequences: false)

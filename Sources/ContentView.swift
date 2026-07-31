@@ -270,11 +270,21 @@ public final class HelmMirrorViewModel: ObservableObject {
     /// frame. Discovery already resolved the plotter's numeric address, so swap
     /// it in. Falls back to the original URL if anything doesn't parse.
     private func playableURL(_ url: String) -> String {
-        guard let host = activePlotter?.host,
-              Helm.isNumericIPv4(host),
-              let rewritten = Helm.rewritingHost(of: url, to: host)
-        else { return url }
-        return rewritten
+        // 1. Prefer the address discovery already resolved for this plotter.
+        if let host = activePlotter?.host,
+           Helm.isNumericIPv4(host),
+           let rewritten = Helm.rewritingHost(of: url, to: host) {
+            return rewritten
+        }
+        // 2. Otherwise resolve the URL's own host with the system resolver, which
+        //    does understand .local even though VLC does not.
+        if let urlHost = Helm.hostComponent(of: url),
+           !Helm.isNumericIPv4(urlHost),
+           let numeric = GarminDiscovery.numericIPv4(for: urlHost),
+           let rewritten = Helm.rewritingHost(of: url, to: numeric) {
+            return rewritten
+        }
+        return url
     }
 
     // MARK: Timers

@@ -216,6 +216,8 @@ actor Lifecycle {
     func adopt(link: HelmLink) { self.link = link }
     func adopt(pipeline: HLSPipeline) { self.pipeline = pipeline }
     func adopt(server: WebServer) { self.server = server }
+    /// Drop a server that failed to bind, so the next port attempt starts clean.
+    func discardServer() { self.server = nil }
 
     func installSignalHandlers() {
         for number in [SIGINT, SIGTERM] {
@@ -381,7 +383,7 @@ func runServer(pipeline: HLSPipeline,
                detail: @escaping @Sendable (Bool) -> String,
                options: Options,
                hlsDirectory: URL,
-               lifecycle: Lifecycle) async {
+               lifecycle: Lifecycle) async -> UInt16 {
     guard let webRoot = Bundle.module.url(forResource: "Web", withExtension: nil) else {
         await stopAndExit(lifecycle, """
             The phone web page is missing from this build.
@@ -391,28 +393,58 @@ func runServer(pipeline: HLSPipeline,
             """)
     }
 
-    let server = WebServer(
-        port: options.port,
-        webRoot: webRoot,
-        hlsDir: hlsDirectory,
-        onTouch: onTouch,
-        status: { [pipeline] in
-            let streaming = await pipeline.isRunning
-            return (streaming, detail(streaming))
-        })
-    await lifecycle.adopt(server: server)
+    // If the requested port is taken (commonly a previous helmbridge that didn't
+    // shut down cleanly), walk forward and use the next free one instead of
+    // failing. Being stuck without a web server on a boat, with no way to ask for
+    // help, is far worse than quietly moving to 8081.
+    let firstPort = options.port
+    let lastPort = UInt16(min(Int(firstPort) + 9, 65535))
+    var lastError: Error?
+    var boundPort: UInt16?
 
-    do {
-        try await server.start()
-    } catch {
-        await stopAndExit(lifecycle, """
-            I could not open port \(options.port) for the phone web page (\(error.localizedDescription)).
+    for candidate in firstPort...lastPort {
+        let server = WebServer(
+            port: candidate,
+            webRoot: webRoot,
+            hlsDir: hlsDirectory,
+            onTouch: onTouch,
+            status: { [pipeline] in
+                let streaming = await pipeline.isRunning
+                return (streaming, detail(streaming))
+            })
+        await lifecycle.adopt(server: server)
 
-            What to do:
-              Another program is probably already using that port. Try a different one:
-                  helmbridge --port 8081
-            """)
+        do {
+            try await server.start()
+            if candidate != firstPort {
+                print("""
+
+                    Note: port \(firstPort) was already in use, so I'm using \(candidate) instead.
+                          Use the address printed below — it has the right port in it.
+                    """)
+            }
+            boundPort = candidate
+            break
+        } catch {
+            lastError = error
+            await lifecycle.discardServer()
+        }
     }
+
+    if let bound = boundPort { return bound }
+
+    await stopAndExit(lifecycle, """
+        I could not open a port for the phone web page. I tried \(firstPort) through \(lastPort).
+        (\(lastError?.localizedDescription ?? "unknown error"))
+
+        What to do:
+          Another program is using those ports. Either quit it, or pick a
+          different range:
+              swift run helmbridge --port 9000
+
+          If a previous helmbridge is stuck, this frees it:
+              pkill -f helmbridge
+        """)
 }
 
 func runBridge(_ options: Options, lifecycle: Lifecycle) async {
@@ -446,14 +478,14 @@ func runBridge(_ options: Options, lifecycle: Lifecycle) async {
                 """)
         }
 
-        await runServer(pipeline: pipeline,
+        let boundPort = await runServer(pipeline: pipeline,
                         onTouch: { _, _, _ in },  // nothing to touch in demo mode
                         detail: { _ in "demo mode — synthetic video, no plotter" },
                         options: options,
                         hlsDirectory: hlsDirectory,
                         lifecycle: lifecycle)
 
-        printPhoneInstructions(port: options.port)
+        printPhoneInstructions(port: boundPort)
         return
     }
 
@@ -483,7 +515,7 @@ func runBridge(_ options: Options, lifecycle: Lifecycle) async {
     }
 
     let plotterName = target.name
-    await runServer(pipeline: pipeline,
+    let boundPort = await runServer(pipeline: pipeline,
                     onTouch: { [link] x, y, down in
                         await link.sendTouch(nx: x, ny: y, down: down)
                     },
@@ -496,7 +528,7 @@ func runBridge(_ options: Options, lifecycle: Lifecycle) async {
                     hlsDirectory: hlsDirectory,
                     lifecycle: lifecycle)
 
-    printPhoneInstructions(port: options.port)
+    printPhoneInstructions(port: boundPort)
 }
 
 // MARK: - Entry point

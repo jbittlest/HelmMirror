@@ -88,7 +88,29 @@ actor WebServer {
 
     // MARK: Lifecycle
 
-    func start() throws {
+    /// Thread-safe one-shot guard: `stateUpdateHandler` can fire repeatedly, but a
+    /// continuation must be resumed exactly once.
+    private final class ResumeOnce: @unchecked Sendable {
+        private let lock = NSLock()
+        private var done = false
+        func once(_ body: () -> Void) {
+            lock.lock()
+            let first = !done
+            done = true
+            lock.unlock()
+            if first { body() }
+        }
+    }
+
+    /// Bind the port and WAIT for the result.
+    ///
+    /// NWListener binds asynchronously: `listener.start()` returns immediately and a
+    /// failure such as "address already in use" only arrives later via
+    /// `stateUpdateHandler`. Returning before that means the caller thinks the server
+    /// is up when it isn't — which is exactly how a stale process on 8080 left the
+    /// phone with nothing to load while the banner cheerfully printed a URL.
+    /// Awaiting `.ready`/`.failed` here lets the caller retry another port.
+    func start() async throws {
         guard listener == nil else { return }
         guard let nwPort = NWEndpoint.Port(rawValue: port), port != 0 else {
             throw WebServerError.invalidPort(port)
@@ -113,6 +135,41 @@ actor WebServer {
         listener.newConnectionHandler = { [weak self] connection in
             Task { await self?.accept(connection) }
         }
+
+        // Phase 1: wait for the bind to actually succeed or fail.
+        let boundPort = port
+        let gate = ResumeOnce()
+        do {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                listener.stateUpdateHandler = { state in
+                    switch state {
+                    case .ready:
+                        gate.once { cont.resume() }
+                    case .failed(let error):
+                        gate.once {
+                            cont.resume(throwing: WebServerError.listenFailed(
+                                port: boundPort, underlying: "\(error)"))
+                        }
+                    case .cancelled:
+                        gate.once {
+                            cont.resume(throwing: WebServerError.listenFailed(
+                                port: boundPort, underlying: "listener was cancelled"))
+                        }
+                    default:
+                        break   // .setup / .waiting — keep waiting
+                    }
+                }
+                listener.start(queue: queue)
+            }
+        } catch {
+            listener.stateUpdateHandler = nil
+            listener.newConnectionHandler = nil
+            listener.cancel()
+            throw error
+        }
+
+        // Phase 2: bound successfully. From here a failure is a genuine runtime
+        // problem (network dropped), so report it rather than retrying a port.
         listener.stateUpdateHandler = { [weak self] state in
             guard case .failed(let error) = state else { return }
             let reason = "\(error)"
@@ -120,7 +177,6 @@ actor WebServer {
         }
 
         self.listener = listener
-        listener.start(queue: queue)
 
         reaper = Task { [weak self] in
             while !Task.isCancelled {

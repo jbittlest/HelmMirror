@@ -1,5 +1,12 @@
 # HelmMirror — Frozen Implementation Spec (v1.0)
 
+> **Superseded in part by `SPEC-RTSP.md` (v2.0).** Everything about discovery, pairing,
+> the TCP session and the byte layouts in §4 still stands and is still authoritative.
+> The **video player** does not: MobileVLCKit and CocoaPods are gone, replaced by a native
+> Swift RTSP/RTP/H.264 player in `Sources/RTSPCore/` + `Sources/RTSP/`. Wherever this
+> document says `MobileVLCKit`, `VLCMediaPlayer`, `Podfile`, `pod install` or
+> `HelmMirror.xcworkspace`, read `SPEC-RTSP.md` instead.
+
 Universal iOS app that discovers any Garmin chartplotter (MFD) over Wi‑Fi and mirrors +
 controls its screen, using Garmin's private ActiveCaptain "Helm" protocol
 (reverse‑engineered; verified against a **Garmin GPSMAP 923xsv**; all plaintext, no TLS).

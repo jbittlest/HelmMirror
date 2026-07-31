@@ -2,26 +2,27 @@
 //  MirrorPlayerView.swift
 //  HelmMirror
 //
-//  SwiftUI wrapper around a VLC-backed UIView that renders the plotter's live
-//  RTSP/H.264 stream and mirrors single/multi-finger touches back to the MFD.
+//  SwiftUI wrapper around a UIView that renders the plotter's live RTSP/H.264
+//  stream and mirrors single/multi-finger touches back to the MFD.
 //
 //  Two jobs:
-//    1. Video  — a `VLCMediaPlayer` drawing into the backing view, tuned for
-//       low latency. Transport is left at MobileVLCKit's default (RTP/AVP/UDP);
-//       we NEVER set `:rtsp-tcp` because the plotter rejects TCP-interleaved
-//       transport with "461 Unsupported transport" (SPEC §4.11).
+//    1. Video  — an `RTSPVideoSession` (native RTSP/RTP/H.264 over
+//       Foundation + Network) feeding an `AVSampleBufferDisplayLayer` by way of
+//       `H264VideoView`. MobileVLCKit is gone: its bundled live555 failed with
+//       error -36 before a single RTSP byte was exchanged, on a stream that
+//       ffplay plays without complaint (SPEC v2.0 §0).
 //    2. Touch  — `touchesBegan/Moved/Ended/Cancelled` are converted to
 //       normalized 0..1 coordinates against the displayed video content rect
 //       (top-left origin) and handed to the injected `onTouch` closure. The
 //       session layer turns those into 16.16 fixed-point TOUCH frames.
 //
-//  Depends only on the shared model types from HelmProtocol (`HelmTouchPoint`),
-//  which compile into this same app module. No session/pairing knowledge here.
+//  Depends only on the shared model types from HelmProtocol (`HelmTouchPoint`)
+//  and on `Sources/RTSP/`, which compile into this same app module. No
+//  session/pairing knowledge here.
 //
 
 import SwiftUI
 import UIKit
-import MobileVLCKit
 
 /// `UIViewRepresentable` that plays `rtspURL` and reports normalized touches.
 ///
@@ -32,13 +33,23 @@ import MobileVLCKit
 /// letterboxes/pillarboxes internally and normalizes against the content rect.
 /// A tiny in-app diagnostic log, shown on screen when playback fails.
 ///
-/// Reading VLC's own console requires the phone to be tethered and unlocked,
+/// Reading the device console requires the phone to be tethered and unlocked,
 /// which is not workable on a boat. Putting the facts on screen means they can
-/// simply be read off.
+/// simply be read off — including the literal RTSP request and response lines,
+/// which is what makes a handshake failure diagnosable at the helm.
 public final class MirrorDiagnostics: ObservableObject, @unchecked Sendable {
     public static let shared = MirrorDiagnostics()
+
+    /// A full RTSP exchange is ~25 lines; anything smaller truncates away the
+    /// part that explains the failure.
+    private static let maxLines = 40
+    /// RTSP lines arrive in bursts, so publishing every one of them straight to
+    /// SwiftUI thrashes the main thread. Coalesce to 10 Hz.
+    private static let publishInterval: TimeInterval = 0.1
+
     private let lock = NSLock()
     private var lines: [String] = []
+    private var publishScheduled = false
     @Published public private(set) var text: String = ""
 
     private init() {}
@@ -47,20 +58,36 @@ public final class MirrorDiagnostics: ObservableObject, @unchecked Sendable {
         NSLog("[HelmMirror] %@", message)
         lock.lock()
         lines.append(message)
-        if lines.count > 12 { lines.removeFirst(lines.count - 12) }
-        let joined = lines.joined(separator: "\n")
+        if lines.count > Self.maxLines { lines.removeFirst(lines.count - Self.maxLines) }
         lock.unlock()
-        DispatchQueue.main.async { self.text = joined }
+        schedulePublish()
     }
 
     public func reset() {
         lock.lock(); lines.removeAll(); lock.unlock()
         DispatchQueue.main.async { self.text = "" }
     }
+
+    /// Publish at most once per `publishInterval`, always with a snapshot taken
+    /// at fire time so the last line of a burst is never lost.
+    private func schedulePublish() {
+        lock.lock()
+        if publishScheduled { lock.unlock(); return }
+        publishScheduled = true
+        lock.unlock()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.publishInterval) { [self] in
+            lock.lock()
+            publishScheduled = false
+            let snapshot = lines.joined(separator: "\n")
+            lock.unlock()
+            text = snapshot
+        }
+    }
 }
 
 /// What the player is doing, so the UI can say something instead of showing a
-/// black rectangle. Without this a VLC failure is completely invisible.
+/// black rectangle. Without this a playback failure is completely invisible.
 public enum MirrorPlaybackState: Equatable {
     case opening
     case buffering
@@ -85,10 +112,14 @@ public enum MirrorPlaybackState: Equatable {
 
 /// One thing to try: a URL plus the transport to try it with.
 ///
-/// The plotter offers several resolutions, and live555 can fail for reasons that
-/// are invisible from the API (it reported -36 on real hardware and VLC then fell
-/// back to its RealMedia RTSP module, which cannot play a standard RTP stream).
-/// Rather than guess, walk a ladder of combinations until one produces frames.
+/// The plotter offers several resolutions, and a transport can fail for reasons
+/// that are invisible from the API. Rather than guess, walk a ladder of
+/// combinations until one produces frames.
+///
+/// `useTCP` is now `preferTCP` (SPEC §5.4/§6.3): `false` means "UDP first, with
+/// one automatic fallback to interleaved TCP inside the session", `true` means
+/// "interleaved TCP only". In practice attempt 1 succeeds and the ladder is
+/// never walked — it stays as the last safety net.
 public struct MirrorAttempt: Equatable, Hashable {
     public let url: String
     public let useTCP: Bool
@@ -155,25 +186,18 @@ public struct MirrorPlayerView: UIViewRepresentable {
 
 // MARK: - Backing view
 
-/// The concrete `UIView` VLC draws into and that captures touches.
-final class MirrorVideoView: UIView, VLCMediaPlayerDelegate {
+/// The concrete `UIView` the decoded stream is displayed in and that captures
+/// touches. `H264VideoView` owns the `AVSampleBufferDisplayLayer` and the
+/// `CMVideoFormatDescription`; this subclass owns the session and the touches.
+final class MirrorVideoView: H264VideoView {
 
-    private let player = VLCMediaPlayer()
+    /// The live RTSP/RTP/H.264 session driving the layer above. Nil when idle.
+    private var session: RTSPVideoSession?
 
-    /// Reports playback state upward. Without a delegate a VLC failure is silent
-    /// and the user just sees black, which is exactly what happened on first use.
+    /// Reports playback state upward. Without this a failure is silent and the
+    /// user just sees black, which is exactly what happened on first use.
     var onState: ((MirrorPlaybackState) -> Void)?
     private var lastReported: MirrorPlaybackState?
-
-    /// VLC reports `.playing` as soon as it has opened the stream, even when no
-    /// picture is being produced — which looked like a hang behind a black view.
-    /// `hasVideoOut` is the honest signal, so poll it and only claim `.playing`
-    /// once frames really exist.
-    private var videoWatch: Timer?
-
-    /// Set once we have seen real video output; used to tell "never started" from
-    /// "started then stopped".
-    private var sawVideoOut = false
 
     /// The URL currently loaded into the player; guards redundant restarts.
     private var currentURLString: String?
@@ -195,107 +219,32 @@ final class MirrorVideoView: UIView, VLCMediaPlayerDelegate {
 
     override init(frame: CGRect) {
         super.init(frame: frame)
-        commonInit()
+        configureMirrorView()
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
-        commonInit()
+        configureMirrorView()
     }
 
-    private func commonInit() {
+    /// The mirror-specific half of `commonInit` (the layer half lives in
+    /// `H264VideoView`): black backing, and multi-touch actually enabled —
+    /// without `isMultipleTouchEnabled` UIKit delivers only one finger.
+    private func configureMirrorView() {
         backgroundColor = .black
         isMultipleTouchEnabled = true
         isUserInteractionEnabled = true
-        player.drawable = self
-        player.delegate = self
-        Self.enableVLCLogging()
-    }
 
-    /// Turn on libvlc's own logging once. Its messages are the only way to see
-    /// WHY a stream produces no picture — the player API just reports "playing".
-    private static var loggingEnabled = false
-    private static func enableVLCLogging() {
-        guard !loggingEnabled else { return }
-        loggingEnabled = true
-        let lib = VLCLibrary.shared()
-        if lib.responds(to: Selector(("setDebugLogging:"))) {
-            lib.setValue(true, forKey: "debugLogging")
-            lib.setValue(3, forKey: "debugLoggingLevel")
+        // The video pipeline reports these three on main; they are the only
+        // player-side facts the on-screen log cannot get from the RTSP layer.
+        onVideoSizeChanged = { size in
+            MirrorDiagnostics.shared.log("fmt: \(Int(size.width))x\(Int(size.height))")
         }
-    }
-
-    // MARK: VLCMediaPlayerDelegate
-
-    func mediaPlayerStateChanged(_ aNotification: Notification) {
-        report(for: player.state)
-    }
-
-    private func report(for state: VLCMediaPlayerState) {
-        let size = player.videoSize
-        MirrorDiagnostics.shared.log(
-            "vlc=\(Self.name(for: state)) out=\(player.hasVideoOut) "
-            + "size=\(Int(size.width))x\(Int(size.height)) "
-            + "tracks=\(player.numberOfVideoTracks) pos=\(String(format: "%.1f", player.position))")
-
-        let mapped: MirrorPlaybackState
-        switch state {
-        case .opening:   mapped = .opening
-        // Never claim .playing on VLC's word alone — require real video output,
-        // otherwise the UI hides its overlay and leaves a bare black screen.
-        case .buffering: mapped = hasRealVideo ? .playing : .buffering
-        case .playing:   mapped = hasRealVideo ? .playing : .buffering
-        case .error:     mapped = .failed
-        case .ended:     mapped = .ended
-        case .stopped:   mapped = sawVideoOut ? .ended : .failed
-        case .paused:    mapped = .stalled
-        default:         return          // .esAdded and friends: not interesting
+        onFirstFrame = {
+            MirrorDiagnostics.shared.log("video: first frame")
         }
-        emit(mapped)
-    }
-
-    static func name(for state: VLCMediaPlayerState) -> String {
-        switch state {
-        case .stopped:   return "stopped"
-        case .opening:   return "opening"
-        case .buffering: return "buffering"
-        case .ended:     return "ended"
-        case .error:     return "error"
-        case .playing:   return "playing"
-        case .paused:    return "paused"
-        case .esAdded:   return "esAdded"
-        @unknown default: return "other(\(state.rawValue))"
-        }
-    }
-
-    /// True only when VLC has an active video output producing a sized picture.
-    private var hasRealVideo: Bool {
-        guard player.hasVideoOut else { return false }
-        let size = player.videoSize
-        return size.width > 0 && size.height > 0
-    }
-
-    private func emit(_ mapped: MirrorPlaybackState) {
-        if mapped == .playing { sawVideoOut = true }
-        guard mapped != lastReported else { return }
-        lastReported = mapped
-        let sink = onState
-        DispatchQueue.main.async { sink?(mapped) }
-    }
-
-    /// Poll for video output. State-change notifications alone are not enough:
-    /// VLC can sit in `.playing` and only later start (or never start) producing
-    /// frames, and it does not fire a state change when that happens.
-    private func startVideoWatch() {
-        videoWatch?.invalidate()
-        videoWatch = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            if self.hasRealVideo {
-                self.emit(.playing)
-            } else if self.lastReported == .playing {
-                // We had a picture and lost it.
-                self.emit(.stalled)
-            }
+        onDecodeFailure = { reason in
+            MirrorDiagnostics.shared.log("video: decode failed — \(Self.trimmed(reason))")
         }
     }
 
@@ -306,68 +255,64 @@ final class MirrorVideoView: UIView, VLCMediaPlayerDelegate {
         let key = "\(useTCP ? "tcp" : "udp")|\(urlString)"
         guard key != currentURLString else { return }
         currentURLString = key
-        guard let url = URL(string: urlString) else { return }
 
         MirrorDiagnostics.shared.log("try \(useTCP ? "TCP" : "UDP") \(urlString)")
 
-        let media = VLCMedia(url: url)
-        // Low-latency live tuning. The plotter serves RTP over UDP only and
-        // rejects TCP-interleaved with 461, so force UDP explicitly rather than
-        // relying on VLC's default (which prefers TCP on some builds — that
-        // negotiation failing is silent and looks exactly like "no video").
-        //
-        // Caching is deliberately more generous than the 150 ms first tried:
-        // too small a buffer on a busy boat network can starve the decoder so it
-        // never produces a first frame.
-        media.addOptions([
-            "network-caching": 1000,
-            "live-caching": 1000,
-            "rtsp-tcp": useTCP,
-            "rtsp-http": false,
-            "clock-jitter": 0,
-            "clock-synchro": 0,
-            "rtsp-frame-buffer-size": 1000000,
-            "avcodec-hw": "none"      // rule out a hardware-decoder failure
-        ])
-        player.media = media
-        // Re-assert the drawable here as well as in init: at init time this view
-        // has a zero frame, and VLC can fail to bring up a video output when the
-        // drawable has no size yet — which renders as a permanent black screen.
-        player.drawable = self
-        sawVideoOut = false
+        // SwiftUI reuses this view when only the attempt changes, so a previous
+        // session may still be running. Drop it, and the stale format
+        // description with it, before starting the next one.
+        session?.stop()
+        session = nil
+        reset()
         lastReported = nil
-        player.play()
-        startVideoWatch()
+
+        guard URL(string: urlString) != nil else {
+            MirrorDiagnostics.shared.log("err: badURL(\(urlString))")
+            emit(.failed)
+            return
+        }
+
+        let session = RTSPVideoSession(url: urlString, preferTCP: useTCP)
+        // Parameter sets and access units arrive on the session's video queue;
+        // both of these are documented safe to call from it.
+        session.onParameterSets = { [weak self] ps in
+            self?.setParameterSets(sps: ps.sps, pps: ps.pps)
+        }
+        session.onAccessUnit = { [weak self] au in
+            self?.enqueue(accessUnit: au.avcc,
+                          isKeyframe: au.isKeyframe,
+                          rtpTimestamp: au.rtpTimestamp)
+        }
+        session.onState = { [weak self] state in
+            self?.emit(state)
+        }
+        self.session = session
+        session.start()
     }
 
-    /// Stop playback and release the drawable. Called from `dismantleUIView`.
+    /// Stop playback and release resources. Called from `dismantleUIView`.
     func teardown() {
-        videoWatch?.invalidate()
-        videoWatch = nil
-        if player.isPlaying { player.stop() }
-        player.drawable = nil
-        player.media = nil
+        session?.stop()
+        session = nil
+        reset()
         currentURLString = nil
-        sawVideoOut = false
         lastReported = nil
+    }
+
+    /// Report a state change upward, once per distinct state.
+    private func emit(_ mapped: MirrorPlaybackState) {
+        guard mapped != lastReported else { return }
+        lastReported = mapped
+        let sink = onState
+        DispatchQueue.main.async { sink?(mapped) }
+    }
+
+    /// SPEC §11: no diagnostic line may run past ~110 characters.
+    private static func trimmed(_ s: String, limit: Int = 80) -> String {
+        s.count <= limit ? s : String(s.prefix(limit)) + "…"
     }
 
     // MARK: Touch capture
-
-    /// VLC needs a drawable with a real size to create its video output. This view
-    /// is constructed at zero size, so re-attach the first time we get real bounds
-    /// and nudge playback if nothing is coming out yet. Without this the player can
-    /// sit in `.playing` forever with a blank picture.
-    private var attachedWithRealSize = false
-
-    override func layoutSubviews() {
-        super.layoutSubviews()
-        guard !attachedWithRealSize, bounds.width > 1, bounds.height > 1 else { return }
-        attachedWithRealSize = true
-        guard player.media != nil, !hasRealVideo else { return }
-        player.drawable = self
-        if !player.isPlaying { player.play() }
-    }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         emit(touches, event: event, down: true)
@@ -442,6 +387,11 @@ final class MirrorVideoView: UIView, VLCMediaPlayerDelegate {
     /// The rectangle the video actually occupies inside `bounds`. When the view
     /// is already at `videoAspect` this is `bounds`; otherwise it is the
     /// letterboxed/pillarboxed content rect (SPEC §7.4 aspect rule).
+    ///
+    /// `videoAspect` comes from the representable and is deliberately NOT
+    /// overwritten by the SPS-derived `videoSize`: the SwiftUI
+    /// `.aspectRatio(...)` modifier defines the layout, so overriding it here
+    /// would silently break the touch mapping. The SPS size is logged instead.
     private func contentRect() -> CGRect {
         let W = bounds.width
         let H = bounds.height

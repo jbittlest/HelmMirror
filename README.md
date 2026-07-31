@@ -68,7 +68,8 @@ Everything in "Build & run" below assumes that's done.
 - A Mac.
 - **Xcode** (from the Mac App Store) — the full app, not just Command Line Tools.
 - **Homebrew** (https://brew.sh) and **XcodeGen**: `brew install xcodegen`
-- **CocoaPods** (for the video library): `brew install cocoapods` (or `sudo gem install cocoapods`)
+- Nothing else. The video player is native Swift (Foundation + Network + AVFoundation);
+  there are **no third-party dependencies and no CocoaPods**.
 - An iPhone or iPad (iOS 16+), a USB cable, and a free Apple ID for signing.
 
 ---
@@ -81,24 +82,26 @@ From this folder (`HelmMirror/`) in Terminal:
 # 1. Generate the Xcode project from project.yml
 xcodegen generate
 
-# 2. Pull in the video library (MobileVLCKit) via CocoaPods
-pod install
-
-# 3. Open the WORKSPACE (not the .xcodeproj — Pods live in the workspace)
-open HelmMirror.xcworkspace
+# 2. Open it
+open HelmMirror.xcodeproj
 ```
 
 Then in Xcode:
 
-4. Select the **HelmMirror** scheme (top bar).
-5. Click the project ▸ **HelmMirror** target ▸ **Signing & Capabilities** ▸ pick your
+3. Select the **HelmMirror** scheme (top bar).
+4. Click the project ▸ **HelmMirror** target ▸ **Signing & Capabilities** ▸ pick your
    **Team** (your Apple ID). Xcode will auto‑create a provisioning profile.
-6. Plug in your iPhone, select it as the run destination (top bar).
-7. Press **▶ Run**. First run: on the iPhone, go to **Settings ▸ General ▸ VPN & Device
+5. Plug in your iPhone, select it as the run destination (top bar).
+6. Press **▶ Run**. First run: on the iPhone, go to **Settings ▸ General ▸ VPN & Device
    Management** and **trust** your developer certificate, then Run again.
 
-> Re‑run `xcodegen generate && pod install` any time you change `project.yml` or the
-> `Podfile`.
+> Re‑run `xcodegen generate` any time you change `project.yml` or add a source file.
+> Or build straight from the command line:
+>
+> ```bash
+> xcodebuild -project HelmMirror.xcodeproj -scheme HelmMirror \
+>   -destination 'generic/platform=iOS' -allowProvisioningUpdates build
+> ```
 
 ---
 
@@ -128,8 +131,15 @@ covered by fast, dependency‑free tests:
 swift test
 ```
 
-This uses the root `Package.swift`, which compiles **only** `Sources/HelmProtocol.swift`
-plus the tests — no Simulator, no VLC.
+This uses the root `Package.swift`, which compiles `Sources/HelmProtocol.swift` plus
+`Sources/RTSPCore/` (the pure half of the RTSP/RTP/H.264 player) and the tests — no
+Simulator, no Xcode project, no third-party code.
+
+There is also a Foundation-only harness that runs with just the Command Line Tools:
+
+```bash
+swift run helmverify
+```
 
 > **If `swift test` says `no such module 'XCTest'`:** your Mac is using the Command Line
 > Tools toolchain, which has no XCTest. Point it at full Xcode once:
@@ -137,18 +147,23 @@ plus the tests — no Simulator, no VLC.
 
 ---
 
-## If the video is black / VLC trouble
+## If the video is black
 
-- **Give it a second or two.** RTSP startup + buffering (`network-caching`) means the
-  first frame isn't instant.
+**Read the on-screen log first.** The app prints the literal RTSP request and response
+lines under the video — `> DESCRIBE …`, `< RTSP/1.0 200 OK`, `sdp: video pt=96 …`. Where
+that list stops is the answer; you should not need a Mac or a cable to diagnose it.
+
+- **Give it a second or two.** Handshake plus the first keyframe is not instant.
 - **Confirm you're on the plotter's Wi‑Fi** and the plotter screen is on.
-- **UDP is mandatory.** The plotter only serves RTSP over **UDP**; it rejects TCP with
-  `461 Unsupported transport`. Never enable VLC's `:rtsp-tcp` option.
-- **Latency too high?** Lower `network-caching`/`live-caching` (try 100–150 ms) in
-  `MirrorPlayerView`. Too low and you get stutter; 100–200 ms is the sweet spot.
+- **UDP first, TCP as a fallback.** The player requests `RTP/AVP` (UDP) and falls back to
+  `$`-interleaved TCP exactly once if SETUP is refused or no RTP arrives within 3 s. Both
+  attempts are visible in the log.
+- **The log stops after `< RTSP/1.0 200 OK` for PLAY.** RTP is not reaching the phone —
+  check that nothing on the network is blocking UDP, and watch for the automatic
+  `no RTP over UDP -> retrying interleaved TCP` line.
 - **Still black?** Sanity‑check the stream outside the app on the Mac (same Wi‑Fi):
   `ffplay -rtsp_transport udp rtsp://<plotter-ip>:554/helm_1280x720.h264`
-  or open that URL in desktop VLC. If that's black too, it's the plotter/link, not the app.
+  If that's black too, it's the plotter/link, not the app.
 - **Touches land in the wrong place?** The mirror must be shown at the native
   **1280×720 (16:9)** aspect so touch normalization matches the video content exactly
   (see the touch‑mapping note in `SPEC.md`).
@@ -159,24 +174,35 @@ plus the tests — no Simulator, no VLC.
 
 ```
 HelmMirror/
-├─ project.yml        # XcodeGen: the iOS app + a macOS wire-test target
-├─ Podfile            # CocoaPods: MobileVLCKit only
-├─ Package.swift      # ALT manifest: `swift test` for the wire core, macOS-only
+├─ project.yml        # XcodeGen: the iOS app (no CocoaPods, no dependencies)
+├─ Package.swift      # ALT manifest: the pure layers + helmverify + the Mac bridge
 ├─ README.md          # this file
-├─ SPEC.md            # the frozen implementation spec (byte layouts + every interface)
+├─ SPEC.md            # the frozen protocol spec (byte layouts + every interface)
+├─ SPEC-RTSP.md       # the frozen spec for the native RTSP/RTP/H.264 player
 ├─ Sources/
 │  ├─ HelmProtocol.swift     # Foundation-only wire core (architect-owned; do not edit)
-│  ├─ GarminDiscovery.swift  # NWBrowser Bonjour discovery            (implement per SPEC)
-│  ├─ HelmPairing.swift      # URLSession pairing + set-role          (implement per SPEC)
-│  ├─ HelmSession.swift      # NWConnection TCP session + keepalive   (implement per SPEC)
-│  ├─ MirrorPlayerView.swift # VLCMediaPlayer + touch capture         (implement per SPEC)
-│  ├─ ContentView.swift      # SwiftUI UI + view model                (implement per SPEC)
-│  └─ HelmMirrorApp.swift    # @main App                              (implement per SPEC)
+│  ├─ GarminDiscovery.swift  # NWBrowser Bonjour discovery
+│  ├─ HelmPairing.swift      # URLSession pairing + set-role
+│  ├─ HelmSession.swift      # NWConnection TCP session + keepalive
+│  ├─ MirrorPlayerView.swift # SwiftUI wrapper + touch capture + diagnostics
+│  ├─ ContentView.swift      # SwiftUI UI + view model
+│  ├─ HelmMirrorApp.swift    # @main App
+│  ├─ RTSPCore/             # PURE (Foundation only) — also built by Package.swift
+│  │  ├─ RTSPMessage.swift  #   RTSP request build / response + `$` frame decode
+│  │  ├─ SDP.swift          #   SDP parse, H.264 track, control-URL joining
+│  │  ├─ RTPPacket.swift    #   RTP header parse, seq arithmetic, reorder buffer
+│  │  └─ H264Depacketizer.swift  # RFC 6184 -> AVCC access units
+│  └─ RTSP/                 # PLATFORM (Network / AVFoundation / UIKit)
+│     ├─ RTSPClient.swift      # the RTSP conversation + interleaved demux
+│     ├─ RTPUDPTransport.swift # the UDP RTP/RTCP socket pair
+│     ├─ H264VideoView.swift   # AVSampleBufferDisplayLayer + format description
+│     └─ RTSPVideoSession.swift# the glue: client + transport -> access units
+├─ Verify/main.swift  # the Foundation-only vector harness (`swift run helmverify`)
 └─ Tests/HelmWireTests/
-   └─ HelmWireTests.swift    # byte-exact vectors (architect-owned)
+   └─ HelmWireTests.swift    # byte-exact vectors under XCTest (architect-owned)
 ```
 
 `Sources/HelmProtocol.swift`, `Tests/HelmWireTests/HelmWireTests.swift`, `project.yml`,
-`Package.swift`, `Podfile`, `README.md`, and `SPEC.md` are the frozen scaffold — **do not
+`Package.swift`, `README.md`, and `SPEC.md` are the frozen scaffold — **do not
 edit them.** Implement the remaining `Sources/*.swift` files exactly to the interfaces in
 `SPEC.md`.

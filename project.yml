@@ -5,7 +5,9 @@ options:
   deploymentTarget:
     iOS: "16.0"
   createIntermediateGroups: true
-  # Xcode 15+; MobileVLCKit is integrated by CocoaPods (see Podfile + README).
+  # Xcode 15+. No third-party dependencies and no CocoaPods: the native
+  # RTSP/RTP/H.264 player in Sources/RTSP + Sources/RTSPCore replaced
+  # MobileVLCKit, so the plain .xcodeproj is the only thing to build.
 
 settings:
   base:
@@ -27,7 +29,10 @@ targets:
   # the moment any app file added `import HelmProtocol` every shared type would
   # become "ambiguous for type lookup". Package.swift builds that module only for
   # the standalone macOS verification path (`swift run helmverify`).
-  # MobileVLCKit is integrated by CocoaPods (see Podfile + README).
+  #
+  # `sources: - path: Sources` recurses, so Sources/RTSPCore (pure, also built
+  # by Package.swift) and Sources/RTSP (Network + AVFoundation + UIKit) are
+  # both picked up with no further entries here.
   # ---------------------------------------------------------------------------
   HelmMirror:
     type: application

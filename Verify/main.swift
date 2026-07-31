@@ -53,6 +53,34 @@ func hex<S: Sequence>(_ a: S) -> String where S.Element == UInt8 {
     a.map { String(format: "%02x", $0) }.joined()
 }
 
+/// "6742e01e" -> Data. Whitespace is ignored so vectors can be written readably.
+func unhex(_ s: String) -> Data {
+    var out = Data()
+    var high: UInt8?
+    for ch in s where !ch.isWhitespace {
+        guard let nibble = ch.hexDigitValue.map({ UInt8($0) }) else { continue }
+        if let h = high {
+            out.append(h << 4 | nibble)
+            high = nil
+        } else {
+            high = nibble
+        }
+    }
+    return out
+}
+
+func bytes(_ s: String) -> [UInt8] { [UInt8](unhex(s)) }
+
+/// CR and LF made visible, so a failed wire-format comparison is readable.
+func escaped(_ s: String) -> String {
+    s.replacingOccurrences(of: "\r", with: "\\r")
+     .replacingOccurrences(of: "\n", with: "\\n")
+}
+
+func checkWire(_ label: String, _ actual: Data, _ expected: String) {
+    check(label, escaped(String(decoding: actual, as: UTF8.self)), escaped(expected))
+}
+
 print("HelmMirror — wire protocol verification")
 print("Foundation-only; no Xcode, no Simulator, no VLC required.")
 
@@ -320,6 +348,675 @@ do {
         }
     }
     expectTrue("makePathSafeToken yields URL-path-safe tags (200 samples)", allSafe)
+}
+
+// =============================================================================
+//  Native RTSP/RTP/H.264 player — the pure layer (SPEC-RTSP §8)
+//
+//  Everything below lives in Sources/RTSPCore/ and imports nothing but
+//  Foundation, which is what lets these vectors run with no Xcode at all.
+// =============================================================================
+
+// MARK: - RTSP requests (SPEC-RTSP §8.1)
+
+section("RTSP requests")
+
+do {
+    let full = "rtsp://172.16.6.155:554/helm_1280x720.h264"
+
+    checkWire("OPTIONS serialization",
+              RTSPRequestBuilder.options(uri: full, cseq: 1, session: nil).serialized(),
+              "OPTIONS \(full) RTSP/1.0\r\nCSeq: 1\r\nUser-Agent: HelmMirror/1.0\r\n\r\n")
+
+    checkWire("DESCRIBE serialization",
+              RTSPRequestBuilder.describe(uri: "rtsp://h/s", cseq: 2).serialized(),
+              "DESCRIBE rtsp://h/s RTSP/1.0\r\nCSeq: 2\r\n"
+              + "Accept: application/sdp\r\nUser-Agent: HelmMirror/1.0\r\n\r\n")
+
+    checkWire("SETUP over UDP",
+              RTSPRequestBuilder.setupUDP(uri: "rtsp://h/s/track1", cseq: 3,
+                                          clientRTPPort: 51000).serialized(),
+              "SETUP rtsp://h/s/track1 RTSP/1.0\r\nCSeq: 3\r\n"
+              + "Transport: RTP/AVP;unicast;client_port=51000-51001\r\n"
+              + "User-Agent: HelmMirror/1.0\r\n\r\n")
+
+    checkWire("SETUP over interleaved TCP",
+              RTSPRequestBuilder.setupTCP(uri: "rtsp://h/s/track1", cseq: 3,
+                                          rtpChannel: 0, rtcpChannel: 1).serialized(),
+              "SETUP rtsp://h/s/track1 RTSP/1.0\r\nCSeq: 3\r\n"
+              + "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n"
+              + "User-Agent: HelmMirror/1.0\r\n\r\n")
+
+    checkWire("PLAY serialization",
+              RTSPRequestBuilder.play(uri: "rtsp://h/s/", cseq: 4,
+                                      session: "8FE3A1B2").serialized(),
+              "PLAY rtsp://h/s/ RTSP/1.0\r\nCSeq: 4\r\nSession: 8FE3A1B2\r\n"
+              + "Range: npt=0.000-\r\nUser-Agent: HelmMirror/1.0\r\n\r\n")
+
+    // The two keepalive/shutdown requests are on the same wire path, so pin them too.
+    checkWire("GET_PARAMETER keepalive",
+              RTSPRequestBuilder.getParameter(uri: "rtsp://h/s/", cseq: 5,
+                                              session: "8FE3A1B2").serialized(),
+              "GET_PARAMETER rtsp://h/s/ RTSP/1.0\r\nCSeq: 5\r\nSession: 8FE3A1B2\r\n"
+              + "User-Agent: HelmMirror/1.0\r\n\r\n")
+
+    checkWire("TEARDOWN serialization",
+              RTSPRequestBuilder.teardown(uri: "rtsp://h/s/", cseq: 6,
+                                          session: "8FE3A1B2").serialized(),
+              "TEARDOWN rtsp://h/s/ RTSP/1.0\r\nCSeq: 6\r\nSession: 8FE3A1B2\r\n"
+              + "User-Agent: HelmMirror/1.0\r\n\r\n")
+
+    // OPTIONS doubles as the keepalive once a session exists, and then it must
+    // carry the id or the server ignores it and drops the session.
+    checkWire("OPTIONS carries Session when given one",
+              RTSPRequestBuilder.options(uri: "rtsp://h/s/", cseq: 7,
+                                         session: "8FE3A1B2").serialized(),
+              "OPTIONS rtsp://h/s/ RTSP/1.0\r\nCSeq: 7\r\nSession: 8FE3A1B2\r\n"
+              + "User-Agent: HelmMirror/1.0\r\n\r\n")
+
+    // wireText is what reaches the on-screen log: same text, LF, no blank line.
+    check("wireText uses LF and drops the blank line",
+          escaped(RTSPRequestBuilder.describe(uri: "rtsp://h/s", cseq: 2).wireText),
+          escaped("DESCRIBE rtsp://h/s RTSP/1.0\nCSeq: 2\n"
+                  + "Accept: application/sdp\nUser-Agent: HelmMirror/1.0"))
+}
+
+// MARK: - RTSP responses (SPEC-RTSP §8.2)
+
+section("RTSP responses")
+
+/// Decode one complete response out of a canned message. Returns nil on a throw
+/// or a short read, both of which the vectors assert on separately.
+func responseItem(_ s: String) -> (response: RTSPResponse, consumed: Int)? {
+    // `try?` already flattens the decoder's Optional return, so this is one
+    // unwrap, not two.
+    guard let (item, consumed) = try? RTSPWireDecoder.decode(Array(s.utf8)),
+          case .response(let response) = item else { return nil }
+    return (response, consumed)
+}
+
+do {
+    let a = "RTSP/1.0 200 OK\r\n"
+        + "CSeq: 2\r\n"
+        + "Content-Base: rtsp://172.16.6.155:554/helm_1280x720.h264/\r\n"
+        + "Content-Type: application/sdp\r\n"
+        + "Content-Length: 5\r\n"
+        + "\r\n"
+        + "hello"
+
+    if let (response, consumed) = responseItem(a) {
+        check("status code", response.statusCode, 200)
+        check("reason phrase", response.reasonPhrase, "OK")
+        check("CSeq", response.cseq ?? -1, 2)
+        check("Content-Base", response.header("content-base") ?? "nil",
+              "rtsp://172.16.6.155:554/helm_1280x720.h264/")
+        check("header lookup is case-insensitive",
+              response.header("Content-Type") ?? "nil", "application/sdp")
+        check("Content-Length", response.contentLength, 5)
+        check("body", String(decoding: response.body, as: UTF8.self), "hello")
+        check("consumed the whole message", consumed, a.utf8.count)
+        expectTrue("200 is a success", response.isSuccess)
+    } else {
+        failed += 1; print("  ✗ response A did not decode")
+    }
+
+    // One byte short of the declared body: the decoder must wait, not guess.
+    let truncated = String(a.dropLast())
+    var truncatedIsNil = false
+    do { truncatedIsNil = try RTSPWireDecoder.decode(Array(truncated.utf8)) == nil } catch { }
+    expectTrue("a body one byte short -> nil", truncatedIsNil)
+
+    if let (_, consumed) = responseItem("RTSP/1.0 200 OK\r\nCSeq: 1\r\n\r\n") {
+        check("head-only response consumes 28 bytes", consumed, 28)
+    } else {
+        failed += 1; print("  ✗ head-only response did not decode")
+    }
+
+    if let (_, consumed) = responseItem("RTSP/1.0 200 OK\nCSeq: 1\n\n") {
+        check("LF-only head consumes 25 bytes", consumed, 25)
+    } else {
+        failed += 1; print("  ✗ LF-only response did not decode")
+    }
+}
+
+do {
+    if let (response, _) = responseItem("RTSP/1.0 200 OK\r\nCSeq: 3\r\nSession: 8FE3A1B2;timeout=60\r\n\r\n") {
+        check("session id", response.sessionId ?? "nil", "8FE3A1B2")
+        check("session timeout", response.sessionTimeout ?? -1, 60)
+    } else {
+        failed += 1; print("  ✗ Session response did not decode")
+    }
+
+    if let (response, _) = responseItem("RTSP/1.0 200 OK\r\nCSeq: 3\r\nSession: ABC\r\n\r\n") {
+        check("session id without timeout", response.sessionId ?? "nil", "ABC")
+        expectTrue("absent timeout is nil", response.sessionTimeout == nil)
+    } else {
+        failed += 1; print("  ✗ Session-without-timeout response did not decode")
+    }
+}
+
+do {
+    if let (response, _) = responseItem("RTSP/1.0 461 Unsupported transport\r\nCSeq: 3\r\n\r\n") {
+        check("461 status code", response.statusCode, 461)
+        check("461 reason phrase", response.reasonPhrase, "Unsupported transport")
+        expectTrue("461 is not a success", !response.isSuccess)
+    } else {
+        failed += 1; print("  ✗ 461 response did not decode")
+    }
+
+    // Guard rail: without checking the version token, an HTTP status line would
+    // silently decode as a server request for the method "HTTP/1.1".
+    var threwMalformedRequest = false
+    do {
+        _ = try RTSPWireDecoder.decode(Array("HTTP/1.1 200 OK\r\n\r\n".utf8))
+    } catch let error as RTSPParseError {
+        threwMalformedRequest = (error == .malformedRequestLine)
+    } catch { }
+    expectTrue("an HTTP status line throws .malformedRequestLine", threwMalformedRequest)
+
+    if let (item, _) = try? RTSPWireDecoder.decode(Array("OPTIONS rtsp://x RTSP/1.0\r\nCSeq: 7\r\n\r\n".utf8)),
+       case .request(let request) = item {
+        check("server request method", request.method, "OPTIONS")
+        check("server request uri", request.uri, "rtsp://x")
+        check("server request CSeq", request.cseq ?? -1, 7)
+    } else {
+        failed += 1; print("  ✗ server-initiated OPTIONS did not decode as a request")
+    }
+}
+
+// MARK: - RTSP interleaved framing (SPEC-RTSP §8.3)
+
+section("RTSP interleaved framing")
+
+func interleavedItem(_ raw: [UInt8], from start: Int = 0) -> (frame: RTSPInterleavedFrame, consumed: Int)? {
+    guard let (item, consumed) = try? RTSPWireDecoder.decode(raw, from: start),
+          case .interleaved(let frame) = item else { return nil }
+    return (frame, consumed)
+}
+
+do {
+    if let (frame, consumed) = interleavedItem([0x24, 0x00, 0x00, 0x04, 0xDE, 0xAD, 0xBE, 0xEF]) {
+        check("interleaved channel", Int(frame.channel), 0)
+        check("interleaved payload", hex(frame.payload), "deadbeef")
+        check("interleaved consumed", consumed, 8)
+    } else {
+        failed += 1; print("  ✗ complete $ frame did not decode")
+    }
+
+    var incompleteIsNil = false
+    do { incompleteIsNil = try RTSPWireDecoder.decode([0x24, 0x01, 0x00, 0x02, 0xAA]) == nil } catch { }
+    expectTrue("incomplete $ frame -> nil", incompleteIsNil)
+
+    if let (frame, consumed) = interleavedItem([0x24, 0x00, 0x00, 0x00]) {
+        check("zero-length $ frame payload", hex(frame.payload), "")
+        check("zero-length $ frame consumed", consumed, 4)
+    } else {
+        failed += 1; print("  ✗ zero-length $ frame did not decode")
+    }
+
+    // Mixed stream: a binary frame and a text message share one octet stream,
+    // which is the whole reason they share a decoder.
+    var mixed: [UInt8] = [0x24, 0x00, 0x00, 0x04, 0xDE, 0xAD, 0xBE, 0xEF]
+    mixed += Array("RTSP/1.0 200 OK\r\nCSeq: 9\r\n\r\n".utf8)
+    if let (frame, first) = interleavedItem(mixed) {
+        check("mixed: first item is the $ frame", hex(frame.payload), "deadbeef")
+        check("mixed: first consumed", first, 8)
+        if let (item, second) = try? RTSPWireDecoder.decode(mixed, from: first),
+           case .response(let response) = item {
+            check("mixed: second item is the response", response.cseq ?? -1, 9)
+            check("mixed: second consumed", second, 28)
+            check("mixed: stream fully drained", first + second, mixed.count)
+        } else {
+            failed += 1; print("  ✗ mixed: response after the $ frame did not decode")
+        }
+    } else {
+        failed += 1; print("  ✗ mixed: $ frame did not decode")
+    }
+}
+
+// MARK: - RTSP Transport header (SPEC-RTSP §8.4)
+
+section("RTSP Transport header")
+
+do {
+    let udp = RTSPTransportHeader.parse(
+        "RTP/AVP;unicast;client_port=51000-51001;server_port=6970-6971;ssrc=1A2B3C4D")
+    expectTrue("UDP transport is not interleaved", !udp.isTCPInterleaved)
+    check("client RTP port", Int(udp.clientRTPPort ?? 0), 51000)
+    check("client RTCP port", Int(udp.clientRTCPPort ?? 0), 51001)
+    check("server RTP port", Int(udp.serverRTPPort ?? 0), 6970)
+    check("server RTCP port", Int(udp.serverRTCPPort ?? 0), 6971)
+    check("ssrc parsed as hex", udp.ssrc ?? 0, UInt32(0x1A2B3C4D))
+
+    let tcp = RTSPTransportHeader.parse("RTP/AVP/TCP;unicast;interleaved=0-1")
+    expectTrue("TCP transport is interleaved", tcp.isTCPInterleaved)
+    check("rtp channel", Int(tcp.rtpChannel ?? 9), 0)
+    check("rtcp channel", Int(tcp.rtcpChannel ?? 9), 1)
+    expectTrue("interleaved transport has no server_port", tcp.serverRTPPort == nil)
+
+    // A single port implies its odd partner, and `source=` is kept verbatim.
+    let single = RTSPTransportHeader.parse("RTP/AVP;unicast;source=172.16.6.155;client_port=9244")
+    check("source", single.source ?? "nil", "172.16.6.155")
+    check("lone client port", Int(single.clientRTPPort ?? 0), 9244)
+    check("implied client RTCP port", Int(single.clientRTCPPort ?? 0), 9245)
+
+    let garbage = RTSPTransportHeader.parse("nonsense")
+    expectTrue("garbage: not interleaved", !garbage.isTCPInterleaved)
+    expectTrue("garbage: every port nil",
+               garbage.clientRTPPort == nil && garbage.serverRTPPort == nil
+               && garbage.rtpChannel == nil && garbage.ssrc == nil && garbage.source == nil)
+}
+
+// MARK: - SDP (SPEC-RTSP §8.5)
+
+section("SDP")
+
+let sdpFixture = """
+v=0
+o=- 1234567890 1 IN IP4 172.16.6.155
+s=H.264 Video, streamed by HelmMirror
+t=0 0
+a=control:*
+m=video 0 RTP/AVP 96
+c=IN IP4 0.0.0.0
+b=AS:4000
+a=rtpmap:96 H264/90000
+a=fmtp:96 packetization-mode=1;profile-level-id=42E01E;sprop-parameter-sets=Z0LgHtoBQBboQAAAAwBAAAAMoeMGVA==,aM48gA==
+a=control:track1
+"""
+
+do {
+    let sdp = SessionDescription.parse(sdpFixture)
+    check("one media section", sdp.media.count, 1)
+    if let video = sdp.media.first {
+        check("media type", video.mediaType, "video")
+        check("media port", video.port, 0)
+        check("media proto", video.proto, "RTP/AVP")
+        check("media formats", video.formats.map(String.init).joined(separator: ","), "96")
+        check("media control", video.control ?? "nil", "track1")
+        check("rtpmap for 96", video.rtpmap(for: 96) ?? "nil", "H264/90000")
+
+        let fmtp = video.fmtp(for: 96) ?? ""
+        check("fmtp packetization-mode",
+              SDPH264.fmtpValue("packetization-mode", in: fmtp) ?? "nil", "1")
+        check("fmtp profile-level-id is case-insensitive",
+              SDPH264.fmtpValue("PROFILE-LEVEL-ID", in: fmtp) ?? "nil", "42E01E")
+        expectTrue("absent fmtp key -> nil", SDPH264.fmtpValue("nope", in: fmtp) == nil)
+    } else {
+        failed += 1; print("  ✗ no media section parsed")
+    }
+    check("session-level control", sdp.sessionControl ?? "nil", "*")
+
+    if let track = SDPH264.h264Track(in: sdp) {
+        check("h264 payload type", Int(track.payloadType), 96)
+        check("h264 clock rate", track.clockRate, 90000)
+        check("h264 packetization mode", track.packetizationMode, 1)
+        check("h264 sps count", track.sps.count, 1)
+        check("h264 pps count", track.pps.count, 1)
+        check("h264 control", track.control ?? "nil", "track1")
+        check("sps bytes", hex(track.sps[0]),
+              "6742e01eda014016e840000003004000000ca1e30654")
+        check("sps is NAL type 7", Int(H264NAL.type(of: track.sps[0])), 7)
+        check("pps bytes", hex(track.pps[0]), "68ce3c80")
+        check("pps is NAL type 8", Int(H264NAL.type(of: track.pps[0])), 8)
+    } else {
+        failed += 1; print("  ✗ no H.264 track found in the fixture")
+    }
+
+    // Real servers omit the base64 padding; a strict decoder loses the PPS.
+    let unpadded = SDPH264.parseSpropParameterSets("aM48gA")
+    check("unpadded base64 still decodes", unpadded.pps.map(hex).joined(separator: ","), "68ce3c80")
+    check("unpadded base64 yields no SPS", unpadded.sps.count, 0)
+}
+
+// MARK: - RTSP control URL joining (SPEC-RTSP §8.6)
+
+section("RTSP control URL joining")
+
+do {
+    check("relative control appends",
+          RTSPURL.resolve(control: "track1", base: "rtsp://h:554/s.h264"),
+          "rtsp://h:554/s.h264/track1")
+    check("relative control with a trailing slash on the base",
+          RTSPURL.resolve(control: "track1", base: "rtsp://h:554/s.h264/"),
+          "rtsp://h:554/s.h264/track1")
+    check("absolute-path control replaces the path",
+          RTSPURL.resolve(control: "/track1", base: "rtsp://h:554/s.h264"),
+          "rtsp://h:554/track1")
+    check("absolute-URL control wins outright",
+          RTSPURL.resolve(control: "rtsp://other/z", base: "rtsp://h/s"),
+          "rtsp://other/z")
+    check("control '*' means the base",
+          RTSPURL.resolve(control: "*", base: "rtsp://h/s"), "rtsp://h/s")
+    check("no control means the base",
+          RTSPURL.resolve(control: nil, base: "rtsp://h/s"), "rtsp://h/s")
+    // Live555-style track names contain '='; nothing may escape them.
+    check("trackID= style control",
+          RTSPURL.resolve(control: "trackID=0", base: "rtsp://h:554/helm_1280x720.h264"),
+          "rtsp://h:554/helm_1280x720.h264/trackID=0")
+
+    if let (withBase, _) = responseItem("RTSP/1.0 200 OK\r\nCSeq: 2\r\nContent-Base: rtsp://h/s/\r\n\r\n"),
+       let (without, _) = responseItem("RTSP/1.0 200 OK\r\nCSeq: 2\r\n\r\n") {
+        check("Content-Base wins over the request URI",
+              RTSPURL.effectiveBase(requestURI: "rtsp://h/s", response: withBase), "rtsp://h/s/")
+        check("no Content-Base falls back to the request URI",
+              RTSPURL.effectiveBase(requestURI: "rtsp://h/s", response: without), "rtsp://h/s")
+    } else {
+        failed += 1; print("  ✗ effectiveBase fixtures did not decode")
+    }
+}
+
+// MARK: - RTP header (SPEC-RTSP §8.7)
+
+section("RTP header")
+
+do {
+    if let p = RTPPacket.parse(bytes("80 60 002A 0001E240 DEADBEEF 6742E01E")) {
+        expectTrue("marker clear", !p.hasMarker)
+        check("payload type", Int(p.payloadType), 96)
+        check("sequence number", Int(p.sequenceNumber), 42)
+        check("timestamp", p.timestamp, UInt32(123456))
+        check("ssrc", p.ssrc, UInt32(0xDEADBEEF))
+        check("payload", hex(p.payload), "6742e01e")
+    } else {
+        failed += 1; print("  ✗ plain RTP packet did not parse")
+    }
+
+    if let p = RTPPacket.parse(bytes("80 E0 002A 0001E240 DEADBEEF AA")) {
+        expectTrue("marker set", p.hasMarker)
+        check("marker packet payload type", Int(p.payloadType), 96)
+        check("marker packet payload", hex(p.payload), "aa")
+    } else {
+        failed += 1; print("  ✗ marker RTP packet did not parse")
+    }
+
+    if let p = RTPPacket.parse(bytes("A0 60 002A 0001E240 DEADBEEF AA 000003")) {
+        check("padding stripped", hex(p.payload), "aa")
+    } else {
+        failed += 1; print("  ✗ padded RTP packet did not parse")
+    }
+
+    if let p = RTPPacket.parse(bytes("90 60 002A 0001E240 DEADBEEF BEDE0001 11223344 AABB")) {
+        check("header extension skipped", hex(p.payload), "aabb")
+    } else {
+        failed += 1; print("  ✗ extended RTP packet did not parse")
+    }
+
+    if let p = RTPPacket.parse(bytes("82 60 002A 0001E240 DEADBEEF 11111111 22222222 AA")) {
+        check("CSRC list skipped", hex(p.payload), "aa")
+    } else {
+        failed += 1; print("  ✗ RTP packet with CSRCs did not parse")
+    }
+
+    expectTrue("version 1 rejected",
+               RTPPacket.parse(bytes("40 60 002A 0001E240 DEADBEEF AA")) == nil)
+    expectTrue("11-byte packet rejected",
+               RTPPacket.parse(bytes("80 60 002A 0001E240 DEADBE")) == nil)
+    expectTrue("padding longer than the payload rejected",
+               RTPPacket.parse(bytes("A0 60 002A 0001E240 DEADBEEF FF")) == nil)
+
+    check("delta(0, 65535)", RTPSeq.delta(0, 65535), 1)
+    check("delta(65535, 0)", RTPSeq.delta(65535, 0), -1)
+    check("delta(5, 5)", RTPSeq.delta(5, 5), 0)
+    expectTrue("0 is newer than 65535", RTPSeq.isNewer(0, than: 65535))
+    expectTrue("65535 is not newer than 0", !RTPSeq.isNewer(65535, than: 0))
+}
+
+// MARK: - RTP reorder buffer (SPEC-RTSP §8.8)
+
+section("RTP reorder buffer")
+
+/// Build a real 12-byte RTP header + payload and parse it back, so the buffer is
+/// exercised through the same path the socket uses.
+func rtp(seq: UInt16, ts: UInt32 = 9000, marker: Bool = false,
+         payload: String = "aa", ssrc: UInt32 = 0xDEADBEEF) -> RTPPacket {
+    var raw = [UInt8]()
+    raw.append(0x80)
+    raw.append(marker ? 0xE0 : 0x60)
+    raw.append(UInt8(truncatingIfNeeded: seq >> 8))
+    raw.append(UInt8(truncatingIfNeeded: seq))
+    for shift in [24, 16, 8, 0] { raw.append(UInt8(truncatingIfNeeded: ts >> UInt32(shift))) }
+    for shift in [24, 16, 8, 0] { raw.append(UInt8(truncatingIfNeeded: ssrc >> UInt32(shift))) }
+    raw += bytes(payload)
+    guard let packet = RTPPacket.parse(raw) else {
+        fatalError("the vector builder itself produced an unparseable packet")
+    }
+    return packet
+}
+
+func seqs(_ output: RTPReorderBuffer.Output) -> String {
+    output.packets.map { String($0.sequenceNumber) }.joined(separator: ",")
+}
+
+do {
+    var buffer = RTPReorderBuffer()
+    check("in order: 100", seqs(buffer.push(rtp(seq: 100))), "100")
+    check("in order: 101", seqs(buffer.push(rtp(seq: 101))), "101")
+    check("in order: 102", seqs(buffer.push(rtp(seq: 102))), "102")
+    check("in order: nothing lost", buffer.stats.lost, 0)
+}
+
+do {
+    var buffer = RTPReorderBuffer()
+    check("reorder: 100 delivers", seqs(buffer.push(rtp(seq: 100))), "100")
+    check("reorder: 102 is held", seqs(buffer.push(rtp(seq: 102))), "")
+    check("reorder: 101 releases both", seqs(buffer.push(rtp(seq: 101))), "101,102")
+    check("reorder: nothing lost", buffer.stats.lost, 0)
+}
+
+do {
+    var buffer = RTPReorderBuffer()
+    _ = buffer.push(rtp(seq: 100))
+    _ = buffer.push(rtp(seq: 102))
+    let flushed = buffer.flush()
+    check("flush delivers the held packet", seqs(flushed), "102")
+    check("flush reports the gap", flushed.lost, 1)
+    check("flush counts the loss in stats", buffer.stats.lost, 1)
+}
+
+do {
+    var buffer = RTPReorderBuffer()
+    _ = buffer.push(rtp(seq: 100))
+    _ = buffer.push(rtp(seq: 101))
+    check("duplicate delivers nothing", seqs(buffer.push(rtp(seq: 100))), "")
+    check("duplicate is counted", buffer.stats.duplicates, 1)
+}
+
+do {
+    var buffer = RTPReorderBuffer()
+    check("wrap: 65535", seqs(buffer.push(rtp(seq: 65535))), "65535")
+    check("wrap: 0", seqs(buffer.push(rtp(seq: 0))), "0")
+    check("wrap: 1", seqs(buffer.push(rtp(seq: 1))), "1")
+    check("wrap: nothing lost across the wrap", buffer.stats.lost, 0)
+}
+
+do {
+    // Over capacity the buffer must give up on the gap rather than stall forever.
+    var buffer = RTPReorderBuffer(capacity: 2)
+    _ = buffer.push(rtp(seq: 100))
+    _ = buffer.push(rtp(seq: 102))
+    _ = buffer.push(rtp(seq: 103))
+    let drained = buffer.push(rtp(seq: 104))
+    check("capacity exceeded drains in order", seqs(drained), "102,103,104")
+    check("capacity exceeded reports the gap", drained.lost, 1)
+}
+
+do {
+    // A new SSRC is a new stream: the old position must not manufacture loss.
+    var buffer = RTPReorderBuffer()
+    _ = buffer.push(rtp(seq: 100, ssrc: 0x11111111))
+    let restarted = buffer.push(rtp(seq: 200, ssrc: 0x22222222))
+    check("SSRC change restarts the stream", seqs(restarted), "200")
+    check("SSRC change reports no loss", restarted.lost, 0)
+    check("SSRC change records no loss in stats", buffer.stats.lost, 0)
+}
+
+// MARK: - H.264 depacketization (SPEC-RTSP §8.9)
+
+section("H.264 depacketization")
+
+let spsHex = "6742e01eda014016e840000003004000000ca1e30654"
+let ppsHex = "68ce3c80"
+let stapAHex = "780016" + spsHex + "0004" + ppsHex
+
+do {
+    switch H264RTPPayload.classify(unhex("419a00")) {
+    case .single(let nal): check("type 1 -> single NAL", hex(nal), "419a00")
+    default: failed += 1; print("  ✗ 419a00 did not classify as a single NAL")
+    }
+    switch H264RTPPayload.classify(unhex("6742e01e")) {
+    case .single(let nal): check("type 7 -> single NAL", hex(nal), "6742e01e")
+    default: failed += 1; print("  ✗ 6742e01e did not classify as a single NAL")
+    }
+
+    if case .fuA(let fu)? = H264RTPPayload.classify(unhex("7c85aabb")) {
+        expectTrue("FU-A start flag", fu.start)
+        expectTrue("FU-A start is not the end", !fu.end)
+        check("FU-A original NAL type", Int(fu.nalType), 5)
+        check("FU-A nri", Int(fu.nri), 3)
+        check("FU-A fragment", hex(fu.fragment), "aabb")
+        check("FU-A reconstructed header", Int(fu.reconstructedHeader), 0x65)
+    } else {
+        failed += 1; print("  ✗ 7c85aabb did not classify as an FU-A start")
+    }
+    if case .fuA(let fu)? = H264RTPPayload.classify(unhex("7c05cc")) {
+        expectTrue("FU-A middle: not start, not end", !fu.start && !fu.end)
+        check("FU-A middle fragment", hex(fu.fragment), "cc")
+    } else {
+        failed += 1; print("  ✗ 7c05cc did not classify as an FU-A middle")
+    }
+    if case .fuA(let fu)? = H264RTPPayload.classify(unhex("7c45dd")) {
+        expectTrue("FU-A end: not start, is end", !fu.start && fu.end)
+        check("FU-A end fragment", hex(fu.fragment), "dd")
+    } else {
+        failed += 1; print("  ✗ 7c45dd did not classify as an FU-A end")
+    }
+
+    expectTrue("empty payload -> nil", H264RTPPayload.classify(Data()) == nil)
+    expectTrue("FU-A with no FU header -> nil", H264RTPPayload.classify(unhex("7c")) == nil)
+    if case .unsupported(let type)? = H264RTPPayload.classify(unhex("5900")) {
+        check("type 25 is unsupported", Int(type), 25)
+    } else {
+        failed += 1; print("  ✗ 5900 did not classify as unsupported")
+    }
+}
+
+do {
+    if let nals = H264RTPPayload.splitSTAPA(unhex(stapAHex)) {
+        check("STAP-A yields two NALs", nals.count, 2)
+        check("STAP-A first NAL is the SPS", hex(nals[0]), spsHex)
+        check("STAP-A second NAL is the PPS", hex(nals[1]), ppsHex)
+    } else {
+        failed += 1; print("  ✗ STAP-A did not split")
+    }
+    expectTrue("truncated STAP-A record -> nil",
+               H264RTPPayload.splitSTAPA(unhex("780004" + "6742")) == nil)
+    expectTrue("zero-size STAP-A record -> nil",
+               H264RTPPayload.splitSTAPA(unhex("780000")) == nil)
+}
+
+do {
+    check("avccPrefixed one NAL", hex(H264NAL.avccPrefixed([unhex("65aa")])), "0000000265aa")
+    check("avccPrefixed two NALs",
+          hex(H264NAL.avccPrefixed([unhex("67"), unhex("6801")])),
+          "0000000167000000026801")
+    let split = H264NAL.annexBToNALs(unhex("00000001" + "67aa" + "000001" + "68bb"))
+    check("annexB split yields two NALs", split.map(hex).joined(separator: ","), "67aa,68bb")
+    check("NAL type of an IDR slice", Int(H264NAL.type(of: unhex("65aa"))), 5)
+    expectTrue("65aa is an IDR", H264NAL.isIDR(unhex("65aa")))
+    expectTrue("6742 is a parameter set", H264NAL.isParameterSet(unhex("6742")))
+}
+
+/// Collect only the access units out of a batch of events.
+func accessUnits(_ events: [H264Depacketizer.Event]) -> [H264AccessUnit] {
+    events.compactMap { if case .accessUnit(let unit) = $0 { return unit } else { return nil } }
+}
+
+func parameterSetEvents(_ events: [H264Depacketizer.Event]) -> [H264ParameterSets] {
+    events.compactMap { if case .parameterSets(let sets) = $0 { return sets } else { return nil } }
+}
+
+func dropEvents(_ events: [H264Depacketizer.Event]) -> [String] {
+    events.compactMap { if case .dropped(let reason) = $0 { return reason } else { return nil } }
+}
+
+do {
+    // 1. FU-A reassembly across three packets, closed by the marker bit.
+    var depacketizer = H264Depacketizer()
+    var events: [H264Depacketizer.Event] = []
+    events += depacketizer.push(rtp(seq: 1, ts: 9000, payload: "7c85aabb"))
+    events += depacketizer.push(rtp(seq: 2, ts: 9000, payload: "7c05cc"))
+    events += depacketizer.push(rtp(seq: 3, ts: 9000, marker: true, payload: "7c45dd"))
+
+    let units = accessUnits(events)
+    check("FU-A produces exactly one access unit", units.count, 1)
+    if let unit = units.first {
+        check("FU-A access unit bytes", hex(unit.avcc), "0000000565aabbccdd")
+        expectTrue("FU-A access unit is a keyframe", unit.isKeyframe)
+        expectTrue("FU-A access unit is not corrupt", !unit.isCorrupt)
+        check("FU-A access unit timestamp", unit.rtpTimestamp, UInt32(9000))
+    }
+}
+
+do {
+    // 2. A single NAL closed by the marker bit.
+    var depacketizer = H264Depacketizer()
+    let units = accessUnits(depacketizer.push(rtp(seq: 1, ts: 9000, marker: true, payload: "419a00")))
+    check("single NAL produces one access unit", units.count, 1)
+    if let unit = units.first {
+        check("single NAL access unit bytes", hex(unit.avcc), "00000003419a00")
+        expectTrue("a type-1 slice is not a keyframe", !unit.isKeyframe)
+    }
+}
+
+do {
+    // 3. Parameter sets are latched, never embedded in an access unit.
+    var depacketizer = H264Depacketizer()
+    let events = depacketizer.push(rtp(seq: 1, ts: 9000, payload: stapAHex))
+    check("STAP-A emits one parameterSets event", parameterSetEvents(events).count, 1)
+    check("STAP-A emits no access unit", accessUnits(events).count, 0)
+    check("SPS latched", depacketizer.parameterSets.sps.count, 1)
+    check("PPS latched", depacketizer.parameterSets.pps.count, 1)
+    check("latched SPS bytes", hex(depacketizer.parameterSets.sps[0]), spsHex)
+    check("latched PPS bytes", hex(depacketizer.parameterSets.pps[0]), ppsHex)
+}
+
+do {
+    // 4. A timestamp change closes the previous picture even with no marker bit.
+    var depacketizer = H264Depacketizer()
+    let first = depacketizer.push(rtp(seq: 1, ts: 9000, payload: "419a00"))
+    check("no marker, no boundary -> nothing yet", accessUnits(first).count, 0)
+
+    let second = depacketizer.push(rtp(seq: 2, ts: 12000, payload: "419a00"))
+    let closed = accessUnits(second)
+    check("a new timestamp closes the previous AU", closed.count, 1)
+    if let unit = closed.first {
+        check("closed AU carries the OLD timestamp", unit.rtpTimestamp, UInt32(9000))
+    }
+    let flushed = accessUnits(depacketizer.flush())
+    check("flush emits the last AU", flushed.count, 1)
+    if let unit = flushed.first {
+        check("flushed AU timestamp", unit.rtpTimestamp, UInt32(12000))
+    }
+}
+
+do {
+    // 5. Loss poisons the FU-A in flight: half a NAL must never reach the decoder.
+    var depacketizer = H264Depacketizer()
+    var events = depacketizer.push(rtp(seq: 1, ts: 9000, payload: "7c85aabb"))
+    events += depacketizer.push(rtp(seq: 3, ts: 9000, marker: true, payload: "7c45dd"),
+                                lostBefore: 2)
+    expectTrue("loss emits a dropped event", !dropEvents(events).isEmpty)
+    let units = accessUnits(events)
+    expectTrue("no access unit is built from a broken fragment",
+               units.allSatisfy { !hex($0.avcc).contains("aabb") })
+}
+
+do {
+    // 6. An access unit with no decodable NAL is never emitted.
+    var depacketizer = H264Depacketizer()
+    let events = depacketizer.push(rtp(seq: 1, ts: 9000, marker: true, payload: "09f0"))
+    check("an AUD alone produces no access unit", accessUnits(events).count, 0)
 }
 
 // MARK: - Summary

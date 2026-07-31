@@ -599,25 +599,81 @@ private struct MirrorScreen: View {
     let onTouch: ([HelmTouchPoint]) -> Void
     let onBack: () -> Void
 
+    @State private var playback: MirrorPlaybackState = .opening
+    @State private var everPlayed = false
+    @State private var timedOut = false
+
+    /// If no frame has arrived by now, say so rather than showing black forever.
+    private static let firstFrameTimeout: TimeInterval = 15
+
+    private var showOverlay: Bool { !playback.isPlaying }
+
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
 
             // Present at 16:9 so the content rect equals the view bounds and
             // MirrorPlayerView's nx = x/width, ny = y/height are exact (SPEC §7.4).
-            MirrorPlayerView(rtspURL: rtspURL, onTouch: onTouch)
-                .aspectRatio(1280.0 / 720.0, contentMode: .fit)
+            MirrorPlayerView(rtspURL: rtspURL, onTouch: onTouch) { state in
+                playback = state
+                if state.isPlaying { everPlayed = true; timedOut = false }
+            }
+            .aspectRatio(1280.0 / 720.0, contentMode: .fit)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            // A black rectangle with no explanation is the worst possible failure
+            // mode — it looks identical to a crash. Always say what is happening.
+            if showOverlay {
+                VStack(spacing: 14) {
+                    if playback == .failed || playback == .ended || timedOut {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.largeTitle)
+                            .foregroundStyle(.yellow)
+                    } else {
+                        ProgressView().controlSize(.large).tint(.white)
+                    }
+
+                    Text(timedOut && !everPlayed
+                         ? "No video arrived from the plotter"
+                         : playback.message)
+                        .font(.headline)
+                        .foregroundStyle(.white)
+                        .multilineTextAlignment(.center)
+
+                    Text(rtspURL)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.white.opacity(0.55))
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 28)
+
+                    if playback == .failed || playback == .ended || timedOut {
+                        Button("Back to plotter list", action: onBack)
+                            .buttonStyle(.borderedProminent)
+                            .padding(.top, 4)
+                    }
+                }
+                .padding(30)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(.black.opacity(0.82))
+                .ignoresSafeArea()
+            }
         }
+        // Always reachable, and legible against black — the old faint chevron on a
+        // black screen looked like the app had simply hung.
         .overlay(alignment: .topLeading) {
             Button(action: onBack) {
-                Image(systemName: "chevron.backward")
-                    .font(.body.weight(.semibold))
-                    .padding(10)
-                    .background(.ultraThinMaterial, in: Circle())
+                Label("Back", systemImage: "chevron.backward")
+                    .font(.subheadline.weight(.semibold))
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 9)
+                    .background(.ultraThinMaterial, in: Capsule())
             }
             .padding(12)
             .tint(.white)
+        }
+        .task {
+            try? await Task.sleep(nanoseconds: UInt64(Self.firstFrameTimeout * 1_000_000_000))
+            if !everPlayed { timedOut = true }
         }
         .ignoresSafeArea()
         .statusBarHidden(true)

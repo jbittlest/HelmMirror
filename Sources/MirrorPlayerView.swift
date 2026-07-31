@@ -30,23 +30,51 @@ import MobileVLCKit
 /// `MirrorPlayerView(rtspURL:onTouch:).aspectRatio(videoAspect, contentMode: .fit)`.
 /// If the view is ever laid out at a different aspect, the backing view
 /// letterboxes/pillarboxes internally and normalizes against the content rect.
+/// What the player is doing, so the UI can say something instead of showing a
+/// black rectangle. Without this a VLC failure is completely invisible.
+public enum MirrorPlaybackState: Equatable {
+    case opening
+    case buffering
+    case playing
+    case stalled
+    case ended
+    case failed
+
+    public var isPlaying: Bool { self == .playing }
+
+    public var message: String {
+        switch self {
+        case .opening:   return "Opening the video stream…"
+        case .buffering: return "Buffering…"
+        case .playing:   return "Playing"
+        case .stalled:   return "Video stalled — waiting for the plotter"
+        case .ended:     return "The plotter stopped sending video"
+        case .failed:    return "Could not play the video stream"
+        }
+    }
+}
+
 public struct MirrorPlayerView: UIViewRepresentable {
     public let rtspURL: String
     public let videoAspect: CGFloat
     public let onTouch: ([HelmTouchPoint]) -> Void
+    public let onState: (MirrorPlaybackState) -> Void
 
     public init(rtspURL: String,
                 videoAspect: CGFloat = 1280.0 / 720.0,
-                onTouch: @escaping ([HelmTouchPoint]) -> Void) {
+                onTouch: @escaping ([HelmTouchPoint]) -> Void,
+                onState: @escaping (MirrorPlaybackState) -> Void = { _ in }) {
         self.rtspURL = rtspURL
         self.videoAspect = videoAspect
         self.onTouch = onTouch
+        self.onState = onState
     }
 
     public func makeUIView(context: Context) -> UIView {
         let view = MirrorVideoView()
         view.videoAspect = videoAspect
         view.onTouch = onTouch
+        view.onState = onState
         view.play(urlString: rtspURL)
         return view
     }
@@ -56,6 +84,7 @@ public struct MirrorPlayerView: UIViewRepresentable {
         // Refresh the live values SwiftUI may have rebuilt this render.
         view.videoAspect = videoAspect
         view.onTouch = onTouch
+        view.onState = onState
         // `play` is a no-op unless the URL actually changed, so this is cheap
         // even though SwiftUI calls updateUIView frequently.
         view.play(urlString: rtspURL)
@@ -69,9 +98,14 @@ public struct MirrorPlayerView: UIViewRepresentable {
 // MARK: - Backing view
 
 /// The concrete `UIView` VLC draws into and that captures touches.
-final class MirrorVideoView: UIView {
+final class MirrorVideoView: UIView, VLCMediaPlayerDelegate {
 
     private let player = VLCMediaPlayer()
+
+    /// Reports playback state upward. Without a delegate a VLC failure is silent
+    /// and the user just sees black, which is exactly what happened on first use.
+    var onState: ((MirrorPlaybackState) -> Void)?
+    private var lastReported: MirrorPlaybackState?
 
     /// The URL currently loaded into the player; guards redundant restarts.
     private var currentURLString: String?
@@ -106,6 +140,31 @@ final class MirrorVideoView: UIView {
         isMultipleTouchEnabled = true
         isUserInteractionEnabled = true
         player.drawable = self
+        player.delegate = self
+    }
+
+    // MARK: VLCMediaPlayerDelegate
+
+    func mediaPlayerStateChanged(_ aNotification: Notification) {
+        report(for: player.state)
+    }
+
+    private func report(for state: VLCMediaPlayerState) {
+        let mapped: MirrorPlaybackState
+        switch state {
+        case .opening:   mapped = .opening
+        case .buffering: mapped = player.isPlaying ? .playing : .buffering
+        case .playing:   mapped = .playing
+        case .error:     mapped = .failed
+        case .ended:     mapped = .ended
+        case .stopped:   mapped = lastReported == .playing ? .ended : .failed
+        case .paused:    mapped = .stalled
+        default:         return          // .esAdded and friends: not interesting
+        }
+        guard mapped != lastReported else { return }
+        lastReported = mapped
+        let sink = onState
+        DispatchQueue.main.async { sink?(mapped) }
     }
 
     // MARK: Playback

@@ -10,7 +10,9 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.9"
-    DEVELOPMENT_TEAM: ""            # <-- set your Apple Developer Team ID in Xcode Signing.
+    # Jimmy's free "Personal Team". Apps signed by a free team expire after 7
+    # days and must be reinstalled from Xcode; a paid account raises that to a year.
+    DEVELOPMENT_TEAM: "W93UVP5TF5"
     CODE_SIGN_STYLE: Automatic
 
 targets:

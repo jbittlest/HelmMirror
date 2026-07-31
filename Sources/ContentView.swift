@@ -625,12 +625,28 @@ private struct MirrorScreen: View {
     @State private var playback: MirrorPlaybackState = .opening
     @State private var everPlayed = false
     @State private var timedOut = false
+    @State private var attemptIndex = 0
     @ObservedObject private var diagnostics = MirrorDiagnostics.shared
 
-    /// If no frame has arrived by now, say so rather than showing black forever.
-    private static let firstFrameTimeout: TimeInterval = 15
+    /// How long to give one attempt before moving to the next combination.
+    private static let attemptTimeout: TimeInterval = 8
+
+    private var attempts: [MirrorAttempt] { MirrorAttempt.ladder(for: rtspURL) }
+    private var attempt: MirrorAttempt {
+        attempts.indices.contains(attemptIndex) ? attempts[attemptIndex]
+                                                : MirrorAttempt(url: rtspURL, useTCP: false)
+    }
+    private var exhausted: Bool { attemptIndex >= attempts.count - 1 }
 
     private var showOverlay: Bool { !playback.isPlaying }
+
+    /// Move to the next URL/transport combination, if one is left.
+    private func nextAttempt() {
+        guard !everPlayed, attemptIndex < attempts.count - 1 else { return }
+        attemptIndex += 1
+        playback = .opening
+        timedOut = false
+    }
 
     var body: some View {
         ZStack {
@@ -638,10 +654,14 @@ private struct MirrorScreen: View {
 
             // Present at 16:9 so the content rect equals the view bounds and
             // MirrorPlayerView's nx = x/width, ny = y/height are exact (SPEC §7.4).
-            MirrorPlayerView(rtspURL: rtspURL, onTouch: onTouch) { state in
+            MirrorPlayerView(rtspURL: attempt.url, useTCP: attempt.useTCP, onTouch: onTouch) { state in
                 playback = state
                 if state.isPlaying { everPlayed = true; timedOut = false }
+                // live555 can fail in ways the API does not explain; just move on
+                // to the next URL/transport rather than stopping at the first one.
+                if state == .failed || state == .ended { nextAttempt() }
             }
+            .id(attempt)   // rebuild the player when the attempt changes
             .aspectRatio(1280.0 / 720.0, contentMode: .fit)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
@@ -649,7 +669,7 @@ private struct MirrorScreen: View {
             // mode — it looks identical to a crash. Always say what is happening.
             if showOverlay {
                 VStack(spacing: 14) {
-                    if playback == .failed || playback == .ended || timedOut {
+                    if (playback == .failed || playback == .ended || timedOut) && exhausted {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .font(.largeTitle)
                             .foregroundStyle(.yellow)
@@ -657,14 +677,18 @@ private struct MirrorScreen: View {
                         ProgressView().controlSize(.large).tint(.white)
                     }
 
-                    Text(timedOut && !everPlayed
+                    Text(timedOut && !everPlayed && exhausted
                          ? "No video arrived from the plotter"
                          : playback.message)
                         .font(.headline)
                         .foregroundStyle(.white)
                         .multilineTextAlignment(.center)
 
-                    Text(rtspURL)
+                    Text("Attempt \(attemptIndex + 1) of \(attempts.count) · \(attempt.useTCP ? "TCP" : "UDP")")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.7))
+
+                    Text(attempt.url)
                         .font(.caption2.monospaced())
                         .foregroundStyle(.white.opacity(0.55))
                         .multilineTextAlignment(.center)
@@ -686,7 +710,7 @@ private struct MirrorScreen: View {
                         .padding(.horizontal, 20)
                     }
 
-                    if playback == .failed || playback == .ended || timedOut {
+                    if (playback == .failed || playback == .ended || timedOut) && exhausted {
                         Button("Back to plotter list", action: onBack)
                             .buttonStyle(.borderedProminent)
                             .padding(.top, 4)
@@ -711,9 +735,13 @@ private struct MirrorScreen: View {
             .padding(12)
             .tint(.white)
         }
-        .task {
-            try? await Task.sleep(nanoseconds: UInt64(Self.firstFrameTimeout * 1_000_000_000))
-            if !everPlayed { timedOut = true }
+        // One timer per attempt: if this combination produces nothing in time,
+        // stop waiting on it and try the next.
+        .task(id: attempt) {
+            try? await Task.sleep(nanoseconds: UInt64(Self.attemptTimeout * 1_000_000_000))
+            guard !Task.isCancelled, !everPlayed else { return }
+            timedOut = true
+            nextAttempt()
         }
         .ignoresSafeArea()
         .statusBarHidden(true)

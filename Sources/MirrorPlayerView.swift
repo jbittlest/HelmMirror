@@ -83,17 +83,47 @@ public enum MirrorPlaybackState: Equatable {
     }
 }
 
+/// One thing to try: a URL plus the transport to try it with.
+///
+/// The plotter offers several resolutions, and live555 can fail for reasons that
+/// are invisible from the API (it reported -36 on real hardware and VLC then fell
+/// back to its RealMedia RTSP module, which cannot play a standard RTP stream).
+/// Rather than guess, walk a ladder of combinations until one produces frames.
+public struct MirrorAttempt: Equatable, Hashable {
+    public let url: String
+    public let useTCP: Bool
+
+    public var label: String { "\(useTCP ? "TCP" : "UDP") \(url)" }
+
+    /// Build the ladder: preferred URL then any alternate resolution, each over
+    /// UDP first (what the protocol notes say the plotter wants) then TCP.
+    public static func ladder(for url: String) -> [MirrorAttempt] {
+        var urls = [url]
+        // The plotter advertises the same stream at more than one size; if the
+        // preferred one will not play, the other one is worth trying.
+        for (a, b) in [("1280x720", "960x540"), ("960x540", "1280x720")] where url.contains(a) {
+            let alt = url.replacingOccurrences(of: a, with: b)
+            if !urls.contains(alt) { urls.append(alt) }
+        }
+        return urls.map { MirrorAttempt(url: $0, useTCP: false) }
+             + urls.map { MirrorAttempt(url: $0, useTCP: true) }
+    }
+}
+
 public struct MirrorPlayerView: UIViewRepresentable {
     public let rtspURL: String
+    public let useTCP: Bool
     public let videoAspect: CGFloat
     public let onTouch: ([HelmTouchPoint]) -> Void
     public let onState: (MirrorPlaybackState) -> Void
 
     public init(rtspURL: String,
+                useTCP: Bool = false,
                 videoAspect: CGFloat = 1280.0 / 720.0,
                 onTouch: @escaping ([HelmTouchPoint]) -> Void,
                 onState: @escaping (MirrorPlaybackState) -> Void = { _ in }) {
         self.rtspURL = rtspURL
+        self.useTCP = useTCP
         self.videoAspect = videoAspect
         self.onTouch = onTouch
         self.onState = onState
@@ -104,7 +134,7 @@ public struct MirrorPlayerView: UIViewRepresentable {
         view.videoAspect = videoAspect
         view.onTouch = onTouch
         view.onState = onState
-        view.play(urlString: rtspURL)
+        view.play(urlString: rtspURL, useTCP: useTCP)
         return view
     }
 
@@ -114,9 +144,8 @@ public struct MirrorPlayerView: UIViewRepresentable {
         view.videoAspect = videoAspect
         view.onTouch = onTouch
         view.onState = onState
-        // `play` is a no-op unless the URL actually changed, so this is cheap
-        // even though SwiftUI calls updateUIView frequently.
-        view.play(urlString: rtspURL)
+        // `play` is a no-op unless the URL or transport actually changed.
+        view.play(urlString: rtspURL, useTCP: useTCP)
     }
 
     public static func dismantleUIView(_ uiView: UIView, coordinator: ()) {
@@ -272,14 +301,14 @@ final class MirrorVideoView: UIView, VLCMediaPlayerDelegate {
 
     // MARK: Playback
 
-    /// Load `urlString` and start playback. Idempotent for an unchanged URL.
-    func play(urlString: String) {
-        guard urlString != currentURLString else { return }
-        currentURLString = urlString
+    /// Load `urlString` and start playback. Idempotent for an unchanged attempt.
+    func play(urlString: String, useTCP: Bool = false) {
+        let key = "\(useTCP ? "tcp" : "udp")|\(urlString)"
+        guard key != currentURLString else { return }
+        currentURLString = key
         guard let url = URL(string: urlString) else { return }
 
-        MirrorDiagnostics.shared.reset()
-        MirrorDiagnostics.shared.log("url \(urlString)")
+        MirrorDiagnostics.shared.log("try \(useTCP ? "TCP" : "UDP") \(urlString)")
 
         let media = VLCMedia(url: url)
         // Low-latency live tuning. The plotter serves RTP over UDP only and
@@ -293,7 +322,7 @@ final class MirrorVideoView: UIView, VLCMediaPlayerDelegate {
         media.addOptions([
             "network-caching": 1000,
             "live-caching": 1000,
-            "rtsp-tcp": false,
+            "rtsp-tcp": useTCP,
             "rtsp-http": false,
             "clock-jitter": 0,
             "clock-synchro": 0,

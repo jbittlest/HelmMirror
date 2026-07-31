@@ -138,7 +138,8 @@ func printPhoneInstructions(port: UInt16) {
     say()
     say(rule)
     say()
-    if let ip = LanAddress.primaryIPv4() {
+    if let net = LanAddress.primaryInterface() {
+        let ip = net.address
         say("   Open this on your phone:")
         say()
         say("       http://\(ip):\(port)")
@@ -147,18 +148,26 @@ func printPhoneInstructions(port: UInt16) {
         say("   icon saved from github.io — that one needs the internet, which")
         say("   the plotter's Wi-Fi does not have.")
         say()
-        // The single most common failure is the phone being on a different
-        // network. Show the subnet explicitly so it can be checked offline.
-        let parts = ip.split(separator: ".")
-        if parts.count == 4 {
-            let subnet = parts.prefix(3).joined(separator: ".")
-            say("   CHECK THIS FIRST if the page will not load:")
-            say("     On the phone: Settings > Wi-Fi > tap the (i) by the network,")
-            say("     and look at IP Address. It MUST start with  \(subnet).")
-            say("       \(subnet).x        -> same network, good")
-            say("       169.254.x.x   -> the phone did not really join")
-            say("       anything else -> the phone is on a different network")
+        say("   That address is THIS MAC (interface \(net.name)), not the plotter.")
+        if let mask = net.netmask, let bits = net.prefixLength {
+            say("   Netmask \(mask)  (/\(bits))")
         }
+        say()
+        // The commonest failure is the phone sitting on a different network.
+        // Derive this from the REAL netmask: a Garmin runs a /12, so an address
+        // like 172.20.1.4 is still the same network as 172.16.6.0. Assuming a
+        // /24 here would give flatly wrong advice.
+        say("   CHECK THIS FIRST if the page will not load:")
+        say("     On the phone: Settings > Wi-Fi > tap the (i) by the network,")
+        say("     and look at IP Address.")
+        if let range = net.networkRangeDescription {
+            say("       It must be within   \(range)")
+        }
+        if let shared = net.sharedPrefix {
+            say("       i.e. it should start with   \(shared).")
+        }
+        say("       169.254.x.x  -> the phone did not really join the network")
+        say("       nothing shown -> the phone is not on this Wi-Fi at all")
         say()
         say("   Your phone must be on the same Wi-Fi network as this Mac.")
     } else {

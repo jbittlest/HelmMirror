@@ -143,6 +143,23 @@ func printPhoneInstructions(port: UInt16) {
         say()
         say("       http://\(ip):\(port)")
         say()
+        say("   Type that into Safari's address bar. Do NOT use a home-screen")
+        say("   icon saved from github.io — that one needs the internet, which")
+        say("   the plotter's Wi-Fi does not have.")
+        say()
+        // The single most common failure is the phone being on a different
+        // network. Show the subnet explicitly so it can be checked offline.
+        let parts = ip.split(separator: ".")
+        if parts.count == 4 {
+            let subnet = parts.prefix(3).joined(separator: ".")
+            say("   CHECK THIS FIRST if the page will not load:")
+            say("     On the phone: Settings > Wi-Fi > tap the (i) by the network,")
+            say("     and look at IP Address. It MUST start with  \(subnet).")
+            say("       \(subnet).x        -> same network, good")
+            say("       169.254.x.x   -> the phone did not really join")
+            say("       anything else -> the phone is on a different network")
+        }
+        say()
         say("   Your phone must be on the same Wi-Fi network as this Mac.")
     } else {
         say("   Could not work out this Mac's Wi-Fi address.")

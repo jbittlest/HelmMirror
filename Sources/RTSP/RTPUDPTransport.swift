@@ -184,24 +184,36 @@ public final class RTPUDPTransport: @unchecked Sendable {
         connection.receiveMessage { [weak self] data, _, isComplete, error in
             guard let self else { return }
 
+            // For UDP every datagram is a complete message, so `isComplete` is
+            // true on each one — only `isComplete` *with no data* means the flow
+            // itself is finished. Re-arming on `isComplete` alone would stop the
+            // stream after a single packet.
+            let fatal = error != nil || (isComplete && data == nil)
+
             self.lock.lock()
             let isStopped = self.stopped
             self.lock.unlock()
+
+            // RE-ARM BEFORE PROCESSING. `onRTP` runs the whole downstream chain —
+            // depacketize, VideoToolbox decode, display — and while it is running
+            // the socket has no outstanding receive, so arriving datagrams are
+            // dropped. On real hardware that cost 5-42 packets per burst at
+            // 1280x720 and produced visible smearing. Arming first lets the stack
+            // buffer the next datagrams instead of discarding them.
+            if !fatal && !isStopped {
+                self.receive(on: connection, deliversRTP: deliversRTP)
+            }
+
             if isStopped { return }
 
             if deliversRTP, let data, !data.isEmpty {
                 self.onRTP?(data)
             }
-            // For UDP every datagram is a complete message, so `isComplete` is
-            // true on each one — only `isComplete` *with no data* means the flow
-            // itself is finished. Re-arming on `isComplete` alone would stop the
-            // stream after a single packet.
-            if error != nil || (isComplete && data == nil) {
+
+            if fatal {
                 connection.cancel()
                 self.forget(connection)
-                return
             }
-            self.receive(on: connection, deliversRTP: deliversRTP)
         }
     }
 

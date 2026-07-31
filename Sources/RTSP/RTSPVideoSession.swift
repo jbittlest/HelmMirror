@@ -65,7 +65,10 @@ public final class RTSPVideoSession {
 
     private var client: RTSPClient?
     private var transport: RTPUDPTransport?
-    private var reorder = RTPReorderBuffer()
+    // A 1280x720 keyframe is hundreds of RTP packets, so the default depth of 32
+    // gives up on a gap far too eagerly and discards packets that were merely
+    // late. Deeper buffer, at the cost of a few more frames of latency.
+    private var reorder = RTPReorderBuffer(capacity: 256, maxJump: 3000)
     private var depacketizer = H264Depacketizer()
 
     private var activeMode: RTSPTransportMode = .udp

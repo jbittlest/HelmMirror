@@ -107,6 +107,16 @@ final class MirrorVideoView: UIView, VLCMediaPlayerDelegate {
     var onState: ((MirrorPlaybackState) -> Void)?
     private var lastReported: MirrorPlaybackState?
 
+    /// VLC reports `.playing` as soon as it has opened the stream, even when no
+    /// picture is being produced — which looked like a hang behind a black view.
+    /// `hasVideoOut` is the honest signal, so poll it and only claim `.playing`
+    /// once frames really exist.
+    private var videoWatch: Timer?
+
+    /// Set once we have seen real video output; used to tell "never started" from
+    /// "started then stopped".
+    private var sawVideoOut = false
+
     /// The URL currently loaded into the player; guards redundant restarts.
     private var currentURLString: String?
 
@@ -153,18 +163,48 @@ final class MirrorVideoView: UIView, VLCMediaPlayerDelegate {
         let mapped: MirrorPlaybackState
         switch state {
         case .opening:   mapped = .opening
-        case .buffering: mapped = player.isPlaying ? .playing : .buffering
-        case .playing:   mapped = .playing
+        // Never claim .playing on VLC's word alone — require real video output,
+        // otherwise the UI hides its overlay and leaves a bare black screen.
+        case .buffering: mapped = hasRealVideo ? .playing : .buffering
+        case .playing:   mapped = hasRealVideo ? .playing : .buffering
         case .error:     mapped = .failed
         case .ended:     mapped = .ended
-        case .stopped:   mapped = lastReported == .playing ? .ended : .failed
+        case .stopped:   mapped = sawVideoOut ? .ended : .failed
         case .paused:    mapped = .stalled
         default:         return          // .esAdded and friends: not interesting
         }
+        emit(mapped)
+    }
+
+    /// True only when VLC has an active video output producing a sized picture.
+    private var hasRealVideo: Bool {
+        guard player.hasVideoOut else { return false }
+        let size = player.videoSize
+        return size.width > 0 && size.height > 0
+    }
+
+    private func emit(_ mapped: MirrorPlaybackState) {
+        if mapped == .playing { sawVideoOut = true }
         guard mapped != lastReported else { return }
         lastReported = mapped
         let sink = onState
         DispatchQueue.main.async { sink?(mapped) }
+    }
+
+    /// Poll for video output. State-change notifications alone are not enough:
+    /// VLC can sit in `.playing` and only later start (or never start) producing
+    /// frames, and it does not fire a state change when that happens.
+    private func startVideoWatch() {
+        videoWatch?.invalidate()
+        videoWatch = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            if self.hasRealVideo {
+                self.emit(.playing)
+            } else if self.lastReported == .playing {
+                // We had a picture and lost it.
+                self.emit(.stalled)
+            }
+        }
     }
 
     // MARK: Playback
@@ -186,18 +226,44 @@ final class MirrorVideoView: UIView, VLCMediaPlayerDelegate {
             "rtsp-frame-buffer-size": 500000
         ])
         player.media = media
+        // Re-assert the drawable here as well as in init: at init time this view
+        // has a zero frame, and VLC can fail to bring up a video output when the
+        // drawable has no size yet — which renders as a permanent black screen.
+        player.drawable = self
+        sawVideoOut = false
+        lastReported = nil
         player.play()
+        startVideoWatch()
     }
 
     /// Stop playback and release the drawable. Called from `dismantleUIView`.
     func teardown() {
+        videoWatch?.invalidate()
+        videoWatch = nil
         if player.isPlaying { player.stop() }
         player.drawable = nil
         player.media = nil
         currentURLString = nil
+        sawVideoOut = false
+        lastReported = nil
     }
 
     // MARK: Touch capture
+
+    /// VLC needs a drawable with a real size to create its video output. This view
+    /// is constructed at zero size, so re-attach the first time we get real bounds
+    /// and nudge playback if nothing is coming out yet. Without this the player can
+    /// sit in `.playing` forever with a blank picture.
+    private var attachedWithRealSize = false
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        guard !attachedWithRealSize, bounds.width > 1, bounds.height > 1 else { return }
+        attachedWithRealSize = true
+        guard player.media != nil, !hasRealVideo else { return }
+        player.drawable = self
+        if !player.isPlaying { player.play() }
+    }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         emit(touches, event: event, down: true)
